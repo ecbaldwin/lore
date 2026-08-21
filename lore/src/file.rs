@@ -553,6 +553,7 @@ async fn stage_local(
                 case_change: stage::StageCaseChange::from_u32(args.case_change),
                 node_flags: node::NodeFlags::NoFlags,
                 file_id: None,
+                trusted_content: None,
                 no_children: false,
                 scan: args.scan != 0,
             };
@@ -618,6 +619,7 @@ async fn stage_merge_local(
                 case_change: stage::StageCaseChange::Error,
                 node_flags: node::NodeFlags::NoFlags,
                 file_id: None,
+                trusted_content: None,
                 no_children: false,
                 scan: true,
             };
@@ -687,6 +689,7 @@ async fn stage_move_local(
                 case_change: stage::StageCaseChange::Error,
                 node_flags: node::NodeFlags::NoFlags,
                 file_id: None,
+                trusted_content: None,
                 no_children: false,
                 scan: true,
             };

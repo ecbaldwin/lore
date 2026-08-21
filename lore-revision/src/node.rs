@@ -321,6 +321,12 @@ pub struct NodeV2 {
     pub address: Address,
 }
 
+/// Cascade fork-local: marks `node.reserved` as carrying a caller-trusted
+/// content address (see stage.rs's `StageOptions::trusted_content` and
+/// commit.rs's trust branch in `commit_file`). Upstream lore never reads
+/// or writes `reserved`; this fork is the only writer.
+pub(crate) const TRUSTED_CONTENT_MARKER: u32 = 0xCA5C_ADE1;
+
 /// A node in the revision tree, 96 bytes (32 bit index, max 4G nodes)
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone, IntoBytes, FromBytes, Immutable)]
