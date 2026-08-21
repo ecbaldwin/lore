@@ -37,6 +37,7 @@ use crate::interface::LoreArray;
 use crate::interface::LoreFileAction;
 use crate::interface::LoreString;
 use crate::link;
+use crate::lore::Address;
 use crate::lore::BranchId;
 use crate::lore::Context;
 use crate::lore::Hash;
@@ -53,6 +54,7 @@ use crate::node::NodeID;
 use crate::node::NodeIDExt;
 use crate::node::NodeLink;
 use crate::node::ROOT_NODE;
+use crate::node::TRUSTED_CONTENT_MARKER;
 use crate::path::emit_path_ignore;
 use crate::progress::max_concurrent_stage_directory_tasks;
 use crate::repository::BASE_SUFFIX;
@@ -296,6 +298,14 @@ pub struct StageOptions {
     pub node_flags: NodeFlags,
     /// Optional file ID
     pub file_id: Option<Context>,
+    /// Cascade fork-local: a content address and size the caller already
+    /// wrote to the immutable store and vouches for, letting `commit()`
+    /// skip re-reading and re-hashing the working-tree file (see
+    /// `node::TRUSTED_CONTENT_MARKER` and `commit.rs`'s trust branch in
+    /// `commit_file`). `None` (the default) is the normal path: content
+    /// context is resolved from filesystem metadata now and hashed at
+    /// commit time.
+    pub trusted_content: Option<(Address, u64)>,
     /// Do not stage any child nodes if set (no recursion)
     pub no_children: bool,
     /// Force a recursive filesystem scan for directory paths.
@@ -2078,6 +2088,14 @@ pub(crate) async fn stage_node_from_metadata(
             }
         };
 
+        if let Some((address, size)) = options.trusted_content {
+            node.address = address;
+            node.size = size;
+            node.reserved = TRUSTED_CONTENT_MARKER;
+        } else {
+            node.reserved = 0;
+        }
+
         if node.is_file() && node.address.context.is_zero() {
             if let Some(file_id) = options.file_id {
                 // Use the supplied file ID, for example a merge of a file add
@@ -2335,6 +2353,10 @@ pub(crate) async fn stage_node_from_metadata(
             let stage_file_node = if !node.is_file() {
                 lore_debug!("Stage node type change to file for node {}", node_link.node);
                 true
+            } else if options.trusted_content.is_some() {
+                // Caller already knows content changed and vouches for the
+                // new address; skip the mtime/hash-based modified check.
+                true
             } else {
                 let node_path = relative_path.join(name.as_str());
 
@@ -2356,6 +2378,17 @@ pub(crate) async fn stage_node_from_metadata(
 
             if stage_file_node {
                 record_staged_file(&mut node, &info);
+                if let Some((address, size)) = options.trusted_content {
+                    node.address = address;
+                    node.size = size;
+                    node.reserved = TRUSTED_CONTENT_MARKER;
+                    // `record_staged_file` leaves the mode for commit to read
+                    // from disk, but commit's trust branch skips that read and
+                    // takes the node's mode as-is, so record it here.
+                    node.mode = info.mode(node.mode);
+                } else {
+                    node.reserved = 0;
+                }
                 maybe_content_modified = true;
             } else if was_dirty_add {
                 maybe_content_modified = true;
@@ -2834,6 +2867,7 @@ async fn stage_from_parent_revision_in_operation(
                 case_change: StageCaseChange::Keep,
                 node_flags: final_flags,
                 file_id: Some(node_staged.address.context),
+                trusted_content: None,
                 no_children: false,
                 scan: true,
             };
@@ -3343,6 +3377,7 @@ pub(crate) async fn stage_link_paths_from_parent_revision(
                 case_change: StageCaseChange::Keep,
                 node_flags: final_flags,
                 file_id: Some(node_staged.address.context),
+                trusted_content: None,
                 no_children: false,
                 scan: true,
             };
