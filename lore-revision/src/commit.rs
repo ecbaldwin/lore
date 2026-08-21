@@ -2707,7 +2707,20 @@ fn commit_file(
             node.flags
         );
 
-        let (address, content_size, mode, modified_time) = if excluded {
+        // Cascade fork-local: OR'd onto the view-exclusion test above, a caller
+        // that already wrote this content to the immutable store (see stage.rs's
+        // `StageOptions::trusted_content`) left `node.reserved` marked and the
+        // real address/size already on the node. Trust it in place of re-reading
+        // and re-hashing the working-tree file, as long as the content is still
+        // actually present locally -- if it isn't (e.g. written early and
+        // evicted before commit), fall through to the normal read/chunk/hash
+        // path below. Nothing was read from disk in that case, so there is no
+        // modified time to record. Only the address is trusted: the conflict
+        // marker check above still reads a file that isn't view-excluded.
+        let trust_staged_node = excluded
+            || (node.reserved == node::TRUSTED_CONTENT_MARKER
+                && immutable::is_stored_local(repository.clone(), node.address).await);
+        let (address, content_size, mode, modified_time) = if trust_staged_node {
             (node.address, node.size, node.mode, None)
         } else {
             if node.address.context.is_zero() {
@@ -2787,6 +2800,10 @@ fn commit_file(
                 node.size = content_size;
                 node.mode = mode;
                 node.child = 0;
+                // Committed: the marker's job (telling this function to trust
+                // the address instead of re-hashing) is done. Clear it so it
+                // doesn't linger on a node no longer backed by an early write.
+                node.reserved = 0;
 
                 node.clear_all_change_flags();
 
@@ -2802,6 +2819,7 @@ fn commit_file(
             let block_dirtied = {
                 let mut block_writer = block.write();
                 let node = block_writer.node(node_index);
+                node.reserved = 0;
                 node.clear_all_change_flags();
 
                 block_writer.mark_dirty()

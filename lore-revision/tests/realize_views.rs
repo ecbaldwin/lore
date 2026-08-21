@@ -160,6 +160,7 @@ mod tests {
                     case_change: StageCaseChange::Error,
                     node_flags: NodeFlags::NoFlags,
                     file_id: None,
+                    trusted_content: None,
                     no_children: false,
                     scan: true,
                 },
