@@ -8,6 +8,7 @@ pub mod cluster;
 pub mod commit;
 pub mod dependency;
 pub mod diff;
+pub mod direct_write;
 pub mod environment;
 pub mod errors;
 pub mod event;
