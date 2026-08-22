@@ -3272,16 +3272,20 @@ pub async fn rehash_staged_directory(
         .forward::<CommitError>("Failed deserializing state block")?
     {
         if child_node.is_staged_delete() {
-            let node_path = state
-                .node_path(repository.clone(), child_node_id)
-                .await
-                .unwrap_or_default();
-            lore_warn!(
-                "Encountered deleted node {child_node_id} when rehashing staged directory node {node_id}: {node_path}"
-            );
-            return Err(CommitError::internal(
-                "Deleted node encountered while rehashing a staged directory",
-            ));
+            // Unlike `rehash_directory`'s commit-time precondition (a
+            // staged-delete node is never live at commit time --
+            // `prune_dirty_for_commit` discards it first), an eager
+            // per-write bubble-up runs on a tree nothing has committed or
+            // pruned yet (see the doc comment above): an eagerly staged
+            // delete (`direct_write::stage_delete_from_facts`,
+            // docs/proposed/direct-to-store-writes.md checkpoint 4) is
+            // exactly this function's expected input, not evidence of a
+            // bug. It contributes nothing to the eventual committed hash
+            // either way, so it's simply excluded here -- the same
+            // exclusion `prune_dirty_for_commit` achieves by removing it
+            // from the tree outright before the real `rehash_directory`
+            // ever runs.
+            continue;
         }
 
         if child_node.is_directory() {
