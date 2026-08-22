@@ -3214,6 +3214,172 @@ fn rehash_directory_recurse(
     })
 }
 
+/// Cascade fork-local: recompute a *staged* (not yet committed) directory's
+/// Merkle address from its live children, the way [`rehash_directory`] does
+/// at commit time -- but without `rehash_directory`'s "children are already
+/// committed" precondition. `rehash_directory` treats a file child still
+/// carrying `NodeFlags::Staged` (or `Dirty`) as evidence `commit()` hasn't
+/// finished with it yet and errors out ("Staged/Dirty node remain after
+/// nodes were committed"); here that is the *expected* state, since this
+/// runs on a tree nothing has committed yet (see
+/// docs/proposed/direct-to-store-writes.md §4/§7 in the cascade `server`
+/// repo -- eager, per-write directory-address bubble-up).
+///
+/// Also, unlike `rehash_directory`, this does not clear the directory
+/// node's own `NodeFlags::StagedBits`: that flag is how a later real
+/// `commit()` (and staged-children tree-walking generally) knows there is
+/// still something staged underneath this directory to process. Clearing
+/// it here would hide the still-staged leaf from `commit()` before
+/// `commit()` has actually run. A subsequent `commit()` calls the real
+/// `rehash_directory` and recomputes the identical hash from the
+/// by-then-committed children -- redundant but not incorrect; skipping
+/// that redundant recompute is a later optimization, not this function's
+/// job.
+pub async fn rehash_staged_directory(
+    repository: Arc<RepositoryContext>,
+    state: Arc<State>,
+    node_id: NodeID,
+) -> Result<(), CommitError> {
+    let block_index = NodeBlock::index(node_id);
+    let node_index = Node::index(node_id);
+    let block = state
+        .block(repository.clone(), block_index)
+        .await
+        .forward::<CommitError>("Failed deserializing state block")?;
+    let node = block.node(node_index);
+
+    if node_id != ROOT_NODE && !node.is_staged() {
+        return Ok(());
+    }
+
+    lore_trace!(
+        "Rehash staged directory node {} address {}",
+        node_id,
+        node.address
+    );
+    debug_assert!(node.is_directory());
+
+    let mut tasks = JoinSet::new();
+    let mut child_data: Vec<NodeHashData> = vec![];
+
+    let mut total_size = 0;
+    let mut children = StateNodeChildrenIterator::new(state.clone(), repository.clone(), node_id)
+        .await
+        .forward::<CommitError>("Failed deserializing state block")?;
+    while let Some((child_node_id, child_node)) = children
+        .next()
+        .await
+        .forward::<CommitError>("Failed deserializing state block")?
+    {
+        if child_node.is_staged_delete() {
+            let node_path = state
+                .node_path(repository.clone(), child_node_id)
+                .await
+                .unwrap_or_default();
+            lore_warn!(
+                "Encountered deleted node {child_node_id} when rehashing staged directory node {node_id}: {node_path}"
+            );
+            return Err(CommitError::internal(
+                "Deleted node encountered while rehashing a staged directory",
+            ));
+        }
+
+        if child_node.is_directory() {
+            lore_trace!(
+                "Spawning staged rehash of directory node {}",
+                child_node_id
+            );
+            lore_spawn!(tasks, {
+                let repository = repository.clone();
+                let state = state.clone();
+                async move {
+                    rehash_staged_directory_recurse(repository, state, child_node_id).await
+                }
+            });
+        } else {
+            lore_trace!(
+                "File node {} mode 0o{:o} size {} flags 0x{:x} address {}",
+                child_node_id,
+                child_node.mode,
+                child_node.size,
+                child_node.flags,
+                child_node.address
+            );
+
+            total_size += child_node.size;
+            child_data.push(NodeHashData::from_node(&child_node));
+        }
+    }
+
+    let mut task_failure = Ok(());
+    while let Some(task) = tasks.join_next().await {
+        if let Ok(result) = task {
+            let result = result?;
+            total_size += result.size;
+            child_data.push(result);
+        } else {
+            task_failure = Err(task.unwrap_err());
+        }
+    }
+    task_failure.internal("Recursion task failed")?;
+
+    child_data.sort_unstable_by_key(|lhs| lhs.name_hash);
+
+    let mut hasher = blake3::Hasher::new();
+    for data in child_data.iter() {
+        // Assumes little endian
+        hasher.update(data.as_bytes());
+    }
+    let blake3_hash = hasher.finalize();
+
+    let block_dirtied = {
+        let mut block_writer = block.write();
+        let node = block_writer.node(node_index);
+        let prev_hash = node.address.hash;
+        node.address.hash = Hash::from(*blake3_hash.as_bytes());
+        node.size = total_size;
+        // Deliberately not clearing StagedBits here -- see doc comment above.
+
+        lore_trace!(
+            "Staged directory {} rehashed, mode 0o{:o} size {} flags 0x{:x} hash {} (previous {})",
+            node_id,
+            node.mode,
+            node.size,
+            node.flags,
+            node.address.hash,
+            prev_hash
+        );
+
+        block_writer.mark_dirty()
+    };
+    if block_dirtied {
+        state.block_modified(block.clone(), block_index);
+        state.mark_dirty();
+    }
+
+    Ok(())
+}
+
+fn rehash_staged_directory_recurse(
+    repository: Arc<RepositoryContext>,
+    state: Arc<State>,
+    node_id: NodeID,
+) -> Pin<Box<dyn Future<Output = Result<NodeHashData, CommitError>> + Send>> {
+    Box::pin(async move {
+        rehash_staged_directory(repository.clone(), state.clone(), node_id).await?;
+
+        let block_index = NodeBlock::index(node_id);
+        let node_index = Node::index(node_id);
+        let block = state
+            .block(repository.clone(), block_index)
+            .await
+            .forward::<CommitError>("Failed deserializing state block")?;
+        let node = block.node(node_index);
+
+        Ok(NodeHashData::from_node(&node))
+    })
+}
+
 fn delta_add(delta: Arc<parking_lot::RwLock<BytesMut>>, node_id: NodeID, flags: u16) {
     let node_delta = NodeDelta::from_node_and_flags(node_id, flags);
     lore_trace!("Record node delta {node_delta:?}");
