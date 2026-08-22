@@ -1985,7 +1985,15 @@ pub(crate) async fn stage_node_from_metadata(
             }
         };
 
-        if let Some((address, size)) = options.trusted_content {
+        // Cascade fork-local: trusted_content vouches for one file's
+        // content address, not a directory's not-yet-computed Merkle
+        // address. Applying it unconditionally here would stamp any
+        // freshly-created ancestor directory on a nested trust-staged path
+        // with the leaf's own (address, size) too -- undetected until now
+        // because every existing caller only ever trust-staged a file
+        // sitting directly at the repository root, where no ancestor
+        // directory is freshly created in the same stage() call.
+        if node.is_file() && let Some((address, size)) = options.trusted_content {
             node.address = address;
             node.size = size;
             node.reserved = TRUSTED_CONTENT_MARKER;
