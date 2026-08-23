@@ -325,7 +325,14 @@ pub struct NodeV2 {
 /// content address (see stage.rs's `StageOptions::trusted_content` and
 /// commit.rs's trust branch in `commit_file`). Upstream lore never reads
 /// or writes `reserved`; this fork is the only writer.
-pub(crate) const TRUSTED_CONTENT_MARKER: u32 = 0xCA5C_ADE1;
+///
+/// `pub`, not `pub(crate)`: a consumer holding a staged `Node` (e.g.
+/// cascade-fs-lore's `read.rs`/`merkle.rs`) needs to tell a genuinely
+/// trustworthy staged address (this fork's own `direct_write.rs` and
+/// `stage.rs`'s `trusted_content` option both set this marker the moment
+/// they write a final, already-correct address) apart from an ordinary
+/// staged node's, whose address stays stale/zero until commit computes it.
+pub const TRUSTED_CONTENT_MARKER: u32 = 0xCA5C_ADE1;
 
 /// A node in the revision tree, 96 bytes (32 bit index, max 4G nodes)
 #[repr(C)]
