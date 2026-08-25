@@ -7470,6 +7470,86 @@ mod obliteration {
             );
         }
     }
+
+    /// `obliterate_shallow` deletes only a fragment list's own bytes, never cascading into the
+    /// addresses it lists -- the property `cascade-fs-lore`'s `stage_gc` depends on to reclaim a
+    /// stale fragment list without risking a still-shared leaf (see `obliterate_shallow`'s doc
+    /// comment on the trait).
+    #[tokio::test]
+    async fn obliterate_shallow_deletes_only_the_containers_own_bytes() {
+        let store = create(
+            None::<&Path>,
+            ImmutableStoreCreateOptions::none(),
+            false,
+            ImmutableStoreSettings::default(),
+        )
+        .await
+        .expect("create store");
+        let partition = Partition::from([0x79u8; 16]);
+        let leaves = [
+            b"the first leaf of a list obliterated shallowly".as_slice(),
+            b"the second leaf of that list, long enough for the list to describe".as_slice(),
+        ];
+        let mut addresses = vec![];
+        let mut references = vec![];
+        let mut content = 0u64;
+        for leaf in leaves {
+            let address = put(&store, partition, leaf).await;
+            references.push(FragmentReference {
+                hash: address.hash,
+                offset_content: content,
+            });
+            content += leaf.len() as u64;
+            addresses.push(address);
+        }
+        let list = Bytes::copy_from_slice(references.as_bytes());
+        let root = Address {
+            hash: hash::hash_slice(&list),
+            context: Context::default(),
+        };
+        store
+            .clone()
+            .put(
+                partition,
+                root,
+                Fragment {
+                    flags: FragmentFlags::PayloadFragmented.bits(),
+                    size_payload: list.len() as u32,
+                    size_content: content,
+                },
+                Some(list),
+                false,
+            )
+            .await
+            .expect("put of the list");
+
+        store
+            .clone()
+            .obliterate_shallow(
+                partition,
+                root,
+                Arc::new(lore_storage::store_types::StoreObliterateStats::default()),
+            )
+            .await
+            .expect("shallow obliterate of the list");
+
+        assert!(
+            matches!(
+                store.clone().get(partition, root).await,
+                Err(StoreError::AddressNotFound(_))
+            ),
+            "the list's own bytes are gone"
+        );
+        for (address, leaf) in addresses.into_iter().zip(leaves) {
+            let (_, read_back) = store
+                .clone()
+                .get(partition, address)
+                .await
+                .and_then(lore_storage::StoreGetData::into_payload)
+                .expect("a listed leaf survives a shallow obliterate of its list");
+            assert_eq!(read_back.as_ref(), leaf);
+        }
+    }
 }
 
 /// `put` refuses a fragment no store should keep, and records whether an entry holds its payload
