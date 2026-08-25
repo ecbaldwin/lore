@@ -458,6 +458,28 @@ pub trait ImmutableStore: Any + Send + Sync {
         stats: Arc<StoreObliterateStats>,
     ) -> Result<(), StoreError>;
 
+    /// Like [`ImmutableStore::obliterate`], but for an address whose payload is a
+    /// fragment-list container: deletes only this address's own stored bytes,
+    /// never cascading into the addresses it lists.
+    ///
+    /// Safe only when the caller has independently established that those listed
+    /// addresses are not orphaned by this same obliteration -- an unconditional
+    /// cascade is `obliterate`'s only implemented shape today, so a caller that
+    /// diffs a fragment-list container as orphaned without also knowing its
+    /// children are unshared elsewhere must keep using `obliterate`, not this.
+    ///
+    /// Defaults to the existing cascading `obliterate`, which is always correct
+    /// for any implementor that doesn't override this -- just not space-optimal
+    /// for a container whose children are still live.
+    async fn obliterate_shallow(
+        self: Arc<Self>,
+        partition: Partition,
+        address: Address,
+        stats: Arc<StoreObliterateStats>,
+    ) -> Result<(), StoreError> {
+        self.obliterate(partition, address, stats).await
+    }
+
     /// Evict fragments from the store until the given max capacity is reached.
     /// When `sync_data` is true, data is synced to the storage media (fsync).
     /// `sink`, when present, receives eviction lifecycle and per-bucket progress.

@@ -65,6 +65,7 @@ use crate::errors::PayloadNotFound;
 use crate::errors::SlowDown;
 use crate::fs_util;
 use crate::hash;
+use crate::immutable_store::ImmutableStore;
 use crate::immutable_store::StoreError;
 use crate::immutable_store::sanitise_fragment_behavior_flags;
 use crate::local::fan_out::GroupLevel;
@@ -2133,6 +2134,76 @@ impl LocalImmutableStore {
         }
     }
 
+    /// Shared body for [`ImmutableStore::obliterate`] and
+    /// [`ImmutableStore::obliterate_shallow`] -- identical except for whether a
+    /// `PayloadFragmented` address's listed children are also recursively
+    /// obliterated. See `obliterate_shallow`'s doc comment for why a caller
+    /// would ever want the non-cascading form.
+    async fn obliterate_impl(
+        self: Arc<Self>,
+        partition: Partition,
+        address: Address,
+        stats: Arc<StoreObliterateStats>,
+        cascade_into_children: bool,
+    ) -> Result<(), StoreError> {
+        lore_base::lore_debug!("Obliterating address {address}");
+
+        // `find` reads the entry and releases the bucket, which is what
+        // this needs: the sub-fragments below each choose their own group
+        // and bucket from their own hash, and one in `bucket_count` of
+        // them chooses the bucket this address lives in.
+        // `tokio::sync::RwLock` is not reentrant, so descending into them
+        // while holding that lock waits on a lock this task already owns.
+        // The fan-out level sets the odds: one child in 65,536 at 256
+        // buckets to a group, one in 256 at one bucket, where every child
+        // in the parent's group collides.
+        let found = self
+            .find(partition, address)
+            .await
+            .forward::<StoreError>("Failed to deserialize store data.")?;
+
+        lore_base::lore_debug!("Lookup match for {address}: {:?}", found.matching);
+
+        if found.matching != StoreMatch::MatchFull {
+            return Err(StoreError::from(AddressNotFound::from(address)));
+        }
+        let data = found.data;
+
+        if cascade_into_children && (data.flags & FragmentFlags::PayloadFragmented) != 0 {
+            lore_base::lore_debug!("Payload fragmented, obliterating subfragments");
+
+            let group = &self.group[address.hash.data()[0] as usize];
+            if let Ok(payload) = Self::load(&group.packstore, data).await.inspect_err(|e| {
+                lore_base::lore_warn!(
+                    "Failed to load fragment while obliterating address {address}: {e:?}"
+                );
+            }) {
+                let payload = payload.to_aligned::<FragmentReference>();
+                for reference in payload.as_type_slice::<FragmentReference>().iter() {
+                    self.clone()
+                        .obliterate(
+                            partition,
+                            Address {
+                                context: address.context,
+                                hash: reference.hash,
+                            },
+                            stats.clone(),
+                        )
+                        .await
+                        .forward_with::<StoreError, _>(|| {
+                            format!("Failed to obliterate immutable {address}.")
+                        })?;
+                }
+            }
+        }
+
+        // Everything this address referenced is gone (or, for a shallow
+        // obliterate, was deliberately left alone), so the address itself can
+        // go. The lock is taken again rather than held throughout: what it
+        // guards is this entry, and none of the walk above needed it.
+        self.clone().obliterate_one(partition, address, stats).await
+    }
+
     async fn evict_group_sized(
         self: Arc<Self>,
         group_index: usize,
@@ -3874,64 +3945,27 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
             &self
                 .instruments
                 .get_labels_for_operation_context("obliterate"),
-            {
-                lore_base::lore_debug!("Obliterating address {address}");
+            self.clone()
+                .obliterate_impl(partition, address, stats, true)
+                .await
+        )
+        .into()
+    }
 
-                // `find` reads the entry and releases the bucket, which is what
-                // this needs: the sub-fragments below each choose their own group
-                // and bucket from their own hash, and one in `bucket_count` of
-                // them chooses the bucket this address lives in.
-                // `tokio::sync::RwLock` is not reentrant, so descending into them
-                // while holding that lock waits on a lock this task already owns.
-                // The fan-out level sets the odds: one child in 65,536 at 256
-                // buckets to a group, one in 256 at one bucket, where every child
-                // in the parent's group collides.
-                let found = self
-                    .find(partition, address)
-                    .await
-                    .forward::<StoreError>("Failed to deserialize store data.")?;
-
-                lore_base::lore_debug!("Lookup match for {address}: {:?}", found.matching);
-
-                if found.matching != StoreMatch::MatchFull {
-                    return Err(StoreError::from(AddressNotFound::from(address)));
-                }
-                let data = found.data;
-
-                if (data.flags & FragmentFlags::PayloadFragmented) != 0 {
-                    lore_base::lore_debug!("Payload fragmented, obliterating subfragments");
-
-                    let group = &self.group[address.hash.data()[0] as usize];
-                    if let Ok(payload) = Self::load(&group.packstore, data).await.inspect_err(|e| {
-                        lore_base::lore_warn!(
-                            "Failed to load fragment while obliterating address {address}: {e:?}"
-                        );
-                    }) {
-                        let payload = payload.to_aligned::<FragmentReference>();
-                        for reference in payload.as_type_slice::<FragmentReference>().iter() {
-                            self.clone()
-                                .obliterate(
-                                    partition,
-                                    Address {
-                                        context: address.context,
-                                        hash: reference.hash,
-                                    },
-                                    stats.clone(),
-                                )
-                                .await
-                                .forward_with::<StoreError, _>(|| {
-                                    format!("Failed to obliterate immutable {address}.")
-                                })?;
-                        }
-                    }
-                }
-
-                // Everything this address referenced is gone, so the address
-                // itself can go. The lock is taken again rather than held
-                // throughout: what it guards is this entry, and none of the walk
-                // above needed it.
-                self.clone().obliterate_one(partition, address, stats).await
-            }
+    async fn obliterate_shallow(
+        self: Arc<Self>,
+        partition: Partition,
+        address: Address,
+        stats: Arc<StoreObliterateStats>,
+    ) -> Result<(), StoreError> {
+        timed!(
+            self.instruments.operation_latency,
+            &self
+                .instruments
+                .get_labels_for_operation_context("obliterate_shallow"),
+            self.clone()
+                .obliterate_impl(partition, address, stats, false)
+                .await
         )
         .into()
     }
@@ -6471,6 +6505,108 @@ mod tests {
                 )
                 .await
                 .expect("the source a match named must be one copy resolves");
+        }
+    }
+
+    /// `obliterate_shallow` must delete only a fragment-list container's own
+    /// bytes, never cascading into the addresses it lists -- the property
+    /// `cascade-fs-lore`'s `stage_gc` depends on to reclaim a stale
+    /// fragment-list container without risking a still-shared leaf chunk
+    /// (see `obliterate_shallow`'s doc comment on the trait).
+    #[tokio::test]
+    async fn obliterate_shallow_deletes_only_the_containers_own_bytes() {
+        let store = create(
+            None::<&Path>,
+            ImmutableStoreCreateOptions::none(),
+            false,
+            ImmutableStoreSettings::default(),
+        )
+        .await
+        .expect("create store");
+        let partition = Partition::from([0x71u8; 16]);
+        let context = Context::default();
+
+        let child_payloads: [&[u8]; 2] = [b"first chunk", b"second chunk"];
+        let mut children = Vec::new();
+        for payload in child_payloads {
+            let address = Address {
+                hash: crate::hash::hash_slice(payload),
+                context,
+            };
+            store
+                .clone()
+                .put(
+                    partition,
+                    address,
+                    Fragment {
+                        flags: 0,
+                        size_payload: payload.len() as u32,
+                        size_content: payload.len() as u64,
+                    },
+                    Some(Bytes::copy_from_slice(payload)),
+                    false,
+                )
+                .await
+                .expect("seed child fragment");
+            children.push(address);
+        }
+
+        let list: Vec<FragmentReference> = children
+            .iter()
+            .scan(0u64, |offset, address| {
+                let entry = FragmentReference {
+                    hash: address.hash,
+                    offset_content: *offset,
+                };
+                *offset += child_payloads[0].len() as u64;
+                Some(entry)
+            })
+            .collect();
+        let list_bytes = list.as_bytes();
+        let container = Address {
+            hash: crate::hash::hash_slice(list_bytes),
+            context,
+        };
+        store
+            .clone()
+            .put(
+                partition,
+                container,
+                Fragment {
+                    flags: FragmentFlags::PayloadFragmented.into(),
+                    size_payload: list_bytes.len() as u32,
+                    size_content: (child_payloads[0].len() + child_payloads[1].len()) as u64,
+                },
+                Some(Bytes::copy_from_slice(list_bytes)),
+                false,
+            )
+            .await
+            .expect("seed fragment-list container");
+
+        store
+            .clone()
+            .obliterate_shallow(
+                partition,
+                container,
+                Arc::new(crate::store_types::StoreObliterateStats::default()),
+            )
+            .await
+            .expect("shallow-obliterate the container");
+
+        let err = store
+            .clone()
+            .get(partition, container)
+            .await
+            .expect_err("the container's own bytes must be gone");
+        assert!(matches!(err, StoreError::AddressNotFound(_)));
+
+        for (address, payload) in children.iter().zip(child_payloads) {
+            let got = store
+                .clone()
+                .get(partition, *address)
+                .await
+                .expect("a listed child must survive a shallow obliterate of its container");
+            assert_eq!(got.payload.as_deref(), Some(payload));
         }
     }
 }

@@ -218,3 +218,40 @@ pub async fn obliterate_address(
 
     Ok(())
 }
+
+/// Like [`obliterate_address`], but for an address whose payload is a
+/// fragment-list container: deletes only its own stored bytes, never
+/// cascading into the addresses it lists. See
+/// [`lore_storage::immutable_store::ImmutableStore::obliterate_shallow`]'s
+/// doc comment for when this is safe to call.
+///
+/// Deliberately does not forward to a remote admin `obliterate` RPC the way
+/// [`obliterate_address`] does -- that RPC has no shallow-obliterate
+/// counterpart yet, and forwarding to the cascading one would reintroduce
+/// the exact cascade-into-live-children risk this function exists to avoid,
+/// just on the remote side. A remote replica's copy of an orphaned
+/// container is left unreclaimed rather than risk that; extending the
+/// remote protocol is a separate, not-yet-needed follow-up.
+pub async fn obliterate_address_shallow(
+    repository: Arc<RepositoryContext>,
+    address: Address,
+) -> Result<(), ObliterateError> {
+    let stats = Arc::new(StoreObliterateStats::default());
+
+    repository
+        .immutable_store()
+        .obliterate_shallow(repository.id, address, stats.clone())
+        .await
+        .forward::<ObliterateError>(&format!(
+            "Failed to shallow-obliterate an address: {address}"
+        ))?;
+
+    event::LoreEvent::FileObliterate(LoreFileObliterateEventData {
+        address,
+        num_fragments: stats.num_fragments.load(Ordering::Relaxed),
+        num_payloads: stats.num_payloads.load(Ordering::Relaxed),
+    })
+    .send();
+
+    Ok(())
+}
