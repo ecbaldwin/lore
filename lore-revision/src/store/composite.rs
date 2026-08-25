@@ -1225,6 +1225,46 @@ impl ImmutableStore for CompositeStore {
             .await
     }
 
+    /// Mirrors `obliterate` above, fanning out to the same two targets --
+    /// but calling `obliterate_shallow` on each rather than `obliterate`, so
+    /// a caller reclaiming a fragment-list container's own bytes (see the
+    /// trait method's doc comment) gets that non-cascading behavior end to
+    /// end through this composite, not just against a bare local store.
+    async fn obliterate_shallow(
+        self: Arc<Self>,
+        partition: Partition,
+        address: Address,
+        stats: Arc<StoreObliterateStats>,
+    ) -> Result<(), StoreError> {
+        if !self.local_durable {
+            let local = self.local.target.clone();
+
+            lore_spawn!(async move {
+                let stats = Arc::new(StoreObliterateStats::default());
+                match local
+                    .obliterate_shallow(partition, address, stats.clone())
+                    .await
+                {
+                    Ok(_) => {
+                        lore_debug!(
+                            "Successfully shallow-obliterated from local store for address: {address}, stats: {stats:?}"
+                        );
+                    }
+                    Err(e) => {
+                        lore_error!(
+                            "Failed to shallow-obliterate from local store for address: {address}: {e:?}"
+                        );
+                    }
+                }
+            });
+        }
+
+        self.durable
+            .store()
+            .obliterate_shallow(partition, address, stats)
+            .await
+    }
+
     async fn evict(
         self: Arc<Self>,
         max_capacity: usize,
