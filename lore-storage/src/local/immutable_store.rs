@@ -1879,6 +1879,20 @@ impl LocalImmutableStore {
                     return false;
                 }
                 let entry = &mut bucket.entry[entry_index];
+                // A tombstone is not an instance waiting for a payload.
+                // `obliterate_one` leaves the entry in the bucket carrying
+                // `PayloadObliterated` and `size_content: 0`, so upgrading it
+                // here would resurrect an address a caller deliberately
+                // reclaimed and pair live bytes with that zero size --
+                // tripping `assign_deduplicated_payload`'s size assertion in a
+                // debug build, and with the assertion compiled out making that
+                // address resolve again, serving the payload while its own
+                // `size_content` still reads 0. Keep scanning rather
+                // than returning false: this hash's entries are contiguous, so
+                // stopping here would skip live siblings past the tombstone.
+                if entry.data.flags & FragmentFlags::PayloadObliterated.bits() != 0 {
+                    return true;
+                }
                 if entry.data.pack_file != data.pack_file
                     || entry.data.pack_offset != data.pack_offset
                 {
@@ -3235,7 +3249,19 @@ impl LocalImmutableStore {
                             match_index += 1;
                         }
                         Ordering::Equal => {
-                            entry.data.assign_deduplicated_payload(rewritten.data);
+                            // Leave a tombstone alone: `obliterate_one` keeps
+                            // the entry in the bucket with
+                            // `PayloadObliterated` and `size_content: 0`, and a
+                            // sibling context can share its hash with an entry
+                            // this pass rewrote. Assigning the rewritten
+                            // payload would resurrect a reclaimed address and
+                            // pair live bytes with that zero size, exactly as
+                            // in `store`'s upgrade sweep. It holds no payload
+                            // in this packfile, so the post-loop assertion is
+                            // unaffected.
+                            if entry.data.flags & FragmentFlags::PayloadObliterated.bits() == 0 {
+                                entry.data.assign_deduplicated_payload(rewritten.data);
+                            }
                             match_index += 1;
                         }
                         Ordering::Greater => {
@@ -7509,5 +7535,98 @@ mod tests {
                 .await
                 .expect("the source a match named must be one copy resolves");
         }
+    }
+
+    /// Re-storing a hash under a *different* context must leave an address that
+    /// was deliberately obliterated obliterated. `obliterate_one` tombstones an
+    /// entry in place -- `PayloadObliterated`, `size_content: 0` -- and the
+    /// entry stays in the bucket, so `store`'s "upgrade every instance of this
+    /// hash to the payload we just stored" sweep can find it and re-point it at
+    /// live bytes while its own `size_content` still reads 0. That trips
+    /// `assign_deduplicated_payload`'s size assertion in a debug build. With
+    /// the assertion compiled out -- `debug-assertions = false`, which is what
+    /// a default `--release` build of a *dependent* workspace gets, since this
+    /// workspace's own `release` profile keeps them on -- there is no panic and
+    /// the tombstone is resurrected instead: `get` on the obliterated address
+    /// succeeds and serves the whole payload, with the entry's `size_content`
+    /// left at 0. Obliteration silently stops sticking.
+    ///
+    /// Reached from the WebDAV write path as three PUTs -- write content, empty
+    /// the path that named it (`stage_gc` obliterates the orphan), write the
+    /// same content to a second path -- see `spike/sqlite-wal/dedup_panic.sh`.
+    #[tokio::test]
+    async fn re_storing_a_hash_leaves_an_obliterated_sibling_obliterated() {
+        let store = create(
+            None::<&Path>,
+            ImmutableStoreCreateOptions::none(),
+            false,
+            ImmutableStoreSettings::default(),
+        )
+        .await
+        .expect("create store");
+        let partition = Partition::from([0x71u8; 16]);
+        let payload: &[u8] = b"content that outlives the path which first named it";
+        let hash = crate::hash::hash_slice(payload);
+        let fragment = Fragment {
+            flags: 0,
+            size_payload: payload.len() as u32,
+            size_content: payload.len() as u64,
+        };
+        let orphaned = Address {
+            hash,
+            context: Context::from([0x01u8; 16]),
+        };
+        let reappearing = Address {
+            hash,
+            context: Context::from([0x02u8; 16]),
+        };
+
+        store
+            .clone()
+            .put(
+                partition,
+                orphaned,
+                fragment,
+                Some(Bytes::copy_from_slice(payload)),
+                false,
+            )
+            .await
+            .expect("seed the content under its first context");
+
+        store
+            .clone()
+            .obliterate(
+                partition,
+                orphaned,
+                Arc::new(crate::store_types::StoreObliterateStats::default()),
+            )
+            .await
+            .expect("obliterate the orphaned address");
+
+        store
+            .clone()
+            .put(
+                partition,
+                reappearing,
+                fragment,
+                Some(Bytes::copy_from_slice(payload)),
+                false,
+            )
+            .await
+            .expect("store the same content under a second context");
+
+        let err = store
+            .clone()
+            .get(partition, orphaned)
+            .await
+            .expect_err("an obliterated address must stay obliterated");
+        assert!(matches!(err, StoreError::AddressNotFound(_)));
+
+        let got = store
+            .clone()
+            .get(partition, reappearing)
+            .await
+            .expect("the re-stored address must resolve");
+        assert_eq!(got.payload.as_deref(), Some(payload));
     }
 }
