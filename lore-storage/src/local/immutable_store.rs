@@ -2102,6 +2102,15 @@ impl LocalImmutableStore {
     ) -> Result<(), StoreError> {
         let group_index = address.hash.data()[0] as usize;
         let group = &self.group[group_index];
+        // Held across the tombstone's write-out below, and taken before the bucket lock to keep
+        // the order `flush_lock -> bucket RwLock -> serialize_lock` that `flush_delayed` and
+        // `flush_all` use. It also keeps a fan-out commit from renaming this bucket's file
+        // underneath that write.
+        let flush_guard = if self.path.is_some() {
+            Some(group.flush_lock.clone().lock_owned().await)
+        } else {
+            None
+        };
         let (bucket_index, mut bucket) = loop {
             let n = group.bucket_count.load(atomic::Ordering::Relaxed);
             let idx = crate::local::fan_out::bucket_index_for(&address.hash, n);
@@ -2158,23 +2167,12 @@ impl LocalImmutableStore {
             return Ok(());
         }
 
-        if is_last_fragment && entry.data.pack_file != 0 {
-            lore_base::lore_debug!(
-                "Fragment payload has no other references, obliterating from packstore"
-            );
-
-            stats.num_payloads.fetch_add(1, atomic::Ordering::Relaxed);
-
-            group
-                .packstore
-                .obliterate(
-                    entry.data.pack_file,
-                    entry.data.pack_offset,
-                    entry.data.size_payload,
-                )
-                .await
-                .forward::<StoreError>("Failed to obliterate payload from pack store.")?;
-        }
+        // The payload to zero, if this entry is its last live reference.
+        let payload = (is_last_fragment && entry.data.pack_file != 0).then_some((
+            entry.data.pack_file,
+            entry.data.pack_offset,
+            entry.data.size_payload,
+        ));
 
         stats.num_fragments.fetch_add(1, atomic::Ordering::Relaxed);
 
@@ -2188,7 +2186,51 @@ impl LocalImmutableStore {
         };
 
         group.dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
-        drop(bucket);
+
+        // The tombstone is durable before the payload is zeroed. Zeroing is written and synced
+        // at once, while a bucket is otherwise written out only after `flush_delay_seconds`; in
+        // the other order a crash between the two leaves the index pointing at zeros, and a read
+        // fails verification ("Local store data failed decompression or verification") where it
+        // should have found nothing. Nor does storing the content again repair it: the entry
+        // still looks live, so a store deduplicates onto the zeroed range. In this order a crash
+        // leaves either the live entry with its bytes, or a tombstone over bytes nothing reads.
+        //
+        // Only paid when a payload is actually zeroed. A tombstone that shares its payload with a
+        // live sibling can wait for the delayed flush: losing it costs nothing but the tombstone.
+        if payload.is_some()
+            && let Some(path) = self.path.as_ref()
+        {
+            ImmutableStoreBucket::serialize(
+                bucket.downgrade(),
+                group.clone(),
+                path,
+                group_index,
+                bucket_index,
+                true,
+            )
+            .await
+            .forward::<StoreError>("Failed to write out an obliterated fragment's tombstone.")?;
+        } else {
+            drop(bucket);
+        }
+        drop(flush_guard);
+
+        if let Some((pack_file, pack_offset, size_payload)) = payload {
+            lore_base::lore_debug!(
+                "Fragment payload has no other references, obliterating from packstore"
+            );
+
+            stats.num_payloads.fetch_add(1, atomic::Ordering::Relaxed);
+
+            // A store of the same content from here on finds only the tombstone
+            // (`pack_file == 0`), so it writes a fresh payload rather than deduplicating onto
+            // this range.
+            group
+                .packstore
+                .obliterate(pack_file, pack_offset, size_payload)
+                .await
+                .forward::<StoreError>("Failed to obliterate payload from pack store.")?;
+        }
 
         let mut flush = group.flush.lock().await;
         let _ = flush.try_join_next();
@@ -5353,6 +5395,47 @@ mod tests {
                     panic!("{address} was written and persisted but reads back as {err:?}")
                 });
         }
+    }
+
+    /// A crash between an obliterate and the next delayed flush must leave the address missing,
+    /// not pointing at zeros. The payload is zeroed and synced at once while the bucket is
+    /// written out later, so persisting the tombstone second left a reopened store with a live
+    /// entry over a zeroed range: a read that fails verification, and a store of the same
+    /// content that deduplicates onto the zeros instead of repairing them.
+    #[tokio::test]
+    async fn an_obliterate_is_durable_before_its_payload_is_zeroed() {
+        let dir = crate::test_util::TempDir::new("is_obliterate_crash_");
+        let partition = Partition::from([9u8; 16]);
+
+        let address = {
+            let store = LocalImmutableStore::new(Some(dir.path().to_path_buf()), client_settings())
+                .await
+                .expect("store opens");
+            let address = put_fragments(&store, partition, 1).await[0];
+            // The live entry is on disk, as it would be long before anything obliterates it.
+            run_delayed_flush(&store).await;
+
+            let dyn_store: Arc<dyn crate::immutable_store::ImmutableStore> = store.clone();
+            dyn_store
+                .obliterate(partition, address, Arc::new(StoreObliterateStats::default()))
+                .await
+                .expect("obliterate succeeds");
+            // No flush: the process ends here, and the delayed flush it scheduled never runs
+            // (it holds only a weak reference).
+            address
+        };
+
+        let store = LocalImmutableStore::new(Some(dir.path().to_path_buf()), client_settings())
+            .await
+            .expect("store reopens");
+        let found = store.find(partition, address).await.expect("find");
+        assert!(
+            found.matching != StoreMatch::MatchFull
+                || found.data.flags & FragmentFlags::PayloadObliterated.bits() != 0,
+            "{address} reopened as a live entry ({:?}, flags {:#x}) over a zeroed payload",
+            found.matching,
+            found.data.flags
+        );
     }
 
     mod oodle_migration_seed {
