@@ -3503,6 +3503,12 @@ impl State {
         let mut iblock = NodeBlock::index(parent_node);
         let mut block = self.block(repository.clone(), iblock).await?;
 
+        // A child staged for deletion holds no name, so a live child by the same
+        // name wins wherever it sits in the chain. Usually it sits first, since a
+        // node taking a name is prepended, but a rename within the directory keeps
+        // the node's place, behind a sibling it replaced. The staged-delete child
+        // is still the answer when it is the only one, for callers that undelete it.
+        let mut staged_delete = None;
         let mut child_node_ref = parent.child();
         let mut cycle = SiblingCycleGuard::new(parent_node);
         while let Some(node_id) = child_node_ref {
@@ -3519,13 +3525,16 @@ impl State {
             node.walk_step(node_id, parent_node, &mut cycle)?;
 
             if node.name_hash == name_hash {
-                return Ok(node_id);
+                if !node.is_staged_delete() {
+                    return Ok(node_id);
+                }
+                staged_delete.get_or_insert(node_id);
             }
 
             child_node_ref = node.sibling();
         }
 
-        Err(NodeNotFound.into())
+        staged_delete.ok_or_else(|| NodeNotFound.into())
     }
 
     pub async fn find_relative_node_link(
