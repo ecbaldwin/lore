@@ -283,6 +283,73 @@ mod tests {
         .await;
     }
 
+    /// A rename within one directory onto a destination staged after the
+    /// source. The renamed node keeps its place in the child chain, behind the
+    /// destination it replaced, which stays there under the same name, staged
+    /// for deletion. The path must still resolve to the renamed node, and a
+    /// delete of it must delete that node. A safe save (write a temp, rename it
+    /// over the original) does this whenever the temp is the older of the two.
+    #[tokio::test]
+    #[allow(clippy::large_futures)]
+    async fn renaming_onto_a_newer_sibling_resolves_to_the_renamed_node() {
+        with_repository(|repository, write_token, tree_state| async move {
+            let content = write_leaf(&repository, b"moveme").await;
+            let original = direct_write::stage_leaf_from_facts(
+                repository.clone(),
+                tree_state.clone(),
+                "src.txt",
+                content,
+            )
+            .await
+            .expect("Failed to stage src.txt");
+
+            let existing_dest = write_leaf(&repository, b"will be overwritten").await;
+            direct_write::stage_leaf_from_facts(
+                repository.clone(),
+                tree_state.clone(),
+                "dest.txt",
+                existing_dest,
+            )
+            .await
+            .expect("Failed to stage dest.txt");
+
+            direct_write::stage_move_from_facts(
+                repository.clone(),
+                tree_state.clone(),
+                "src.txt",
+                "dest.txt",
+            )
+            .await
+            .expect("Failed to move src.txt -> dest.txt");
+
+            let fresh = resync(&repository, &write_token, &tree_state).await;
+            for state in [&tree_state, &fresh] {
+                let link = state
+                    .find_node_link(repository.clone(), "dest.txt")
+                    .await
+                    .expect("Failed to find dest.txt");
+                assert_eq!(link.node, original, "dest.txt must be the renamed node");
+                let node = state
+                    .node(repository.clone(), link.node)
+                    .await
+                    .expect("Failed to load dest.txt");
+                assert!(!node.is_staged_delete());
+                assert_eq!(node.address, content.address);
+            }
+
+            let deleted =
+                direct_write::stage_delete_from_facts(repository.clone(), fresh, "dest.txt")
+                    .await
+                    .expect("Failed to delete dest.txt");
+            assert_eq!(
+                deleted,
+                Some(original),
+                "the delete must take the renamed node"
+            );
+        })
+        .await;
+    }
+
     #[tokio::test]
     #[allow(clippy::large_futures)]
     async fn recreating_a_deleted_path_undeletes_instead_of_staying_hidden() {
