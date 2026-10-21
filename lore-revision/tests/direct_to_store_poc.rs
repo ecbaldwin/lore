@@ -104,7 +104,7 @@ mod tests {
                 // A brand new, empty in-memory tree -- the equivalent of the
                 // staged state a real write path would hold for the
                 // lifetime of the serving process (§7 of the doc).
-                let tree_state = Arc::new(state::State::new());
+                let tree_state = state::State::new();
 
                 // Walk "a/b/c.txt" from the root, one component at a time,
                 // using only caller-supplied facts (name, is-directory, and
