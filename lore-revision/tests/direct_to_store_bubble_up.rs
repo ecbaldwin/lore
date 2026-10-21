@@ -134,7 +134,7 @@ mod tests {
                 .expect("Failed to write leaf content to store (A)");
                 let size = leaf_content.len() as u64;
 
-                let tree_state = Arc::new(state::State::new());
+                let tree_state = state::State::new();
 
                 let dir_a = tree_state
                     .node_add(
