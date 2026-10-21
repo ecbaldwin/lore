@@ -102,7 +102,7 @@ mod tests {
                     new_repository(immutable_store, mutable_store, tempdir.path()).await;
 
                 let content = write_leaf(&repository, b"first content").await;
-                let tree_state = Arc::new(state::State::new());
+                let tree_state = state::State::new();
 
                 let leaf = direct_write::stage_leaf_from_facts(
                     repository.clone(),
@@ -222,7 +222,7 @@ mod tests {
                     new_repository(immutable_store, mutable_store, tempdir.path()).await;
 
                 let content = write_leaf(&repository, b"leaf at 'a'").await;
-                let tree_state = Arc::new(state::State::new());
+                let tree_state = state::State::new();
 
                 // Stage a *file* at "a" first.
                 direct_write::stage_leaf_from_facts(
