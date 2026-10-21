@@ -108,7 +108,7 @@ mod tests {
                 std::fs::create_dir_all(tempdir.path()).expect("Create directory failed");
                 let (repository, write_token) =
                     new_repository(immutable_store, mutable_store, tempdir.path()).await;
-                let tree_state = Arc::new(state::State::new());
+                let tree_state = state::State::new();
 
                 body(repository, write_token, tree_state).await;
 
