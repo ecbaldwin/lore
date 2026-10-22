@@ -4,6 +4,7 @@ pub mod branch;
 pub mod clear;
 pub mod find;
 pub mod get;
+pub mod in_state;
 pub mod list;
 pub mod repository;
 pub mod set;

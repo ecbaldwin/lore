@@ -54,8 +54,12 @@ use crate::errors::InvalidArguments;
 use crate::errors::NodeNotFound;
 use crate::hash;
 use crate::lore::Address;
+use crate::lore::Hash;
+use crate::node;
 use crate::node::Node;
 use crate::node::NodeBlock;
+use crate::node::NodeFileMetadata;
+use crate::node::NodeFileMetadataBlock;
 use crate::node::NodeFlags;
 use crate::node::NodeID;
 use crate::node::ROOT_NODE;
@@ -161,6 +165,11 @@ async fn stage_path_from_facts(
 /// `node_mark` call that branch also makes: callers here always follow up
 /// with their own `node_mark` (a leaf's, whose bubble-up already covers
 /// every ancestor this function might be called for).
+///
+/// Also clears the node's file metadata. The node is reused so the file's
+/// history stays continuous, but to whoever deleted the path and created it
+/// again it's a new file, and a new file has no metadata (`rm x; touch x`
+/// leaves `x` with no extended attributes).
 async fn clear_staged_delete(
     state: &Arc<State>,
     repository: &Arc<RepositoryContext>,
@@ -176,6 +185,28 @@ async fn clear_staged_delete(
     if dirtied {
         state.block_modified(block, block_index);
         state.mark_dirty();
+    }
+
+    let metadata_node = node::node_to_file_metadata(node_id);
+    let metadata_block_index = NodeFileMetadataBlock::index(metadata_node);
+    if let Some(metadata_block) = state
+        .try_block_file_metadata_existing(repository.clone(), metadata_block_index)
+        .await?
+    {
+        let dirtied = {
+            let mut block_writer = metadata_block.write();
+            let slot = block_writer.node(NodeFileMetadata::index(metadata_node));
+            if slot.metadata.is_zero() {
+                false
+            } else {
+                slot.metadata = Hash::default();
+                block_writer.mark_dirty()
+            }
+        };
+        if dirtied {
+            state.block_file_metadata_modified(metadata_block, metadata_block_index);
+            state.mark_dirty();
+        }
     }
     Ok(())
 }
