@@ -53,10 +53,7 @@ pub async fn file_metadata_hash(
 ) -> Result<Hash, MetadataError> {
     let metadata_node = node::node_to_file_metadata(node);
     let block = state
-        .try_block_file_metadata_existing(
-            repository,
-            NodeFileMetadataBlock::index(metadata_node),
-        )
+        .try_block_file_metadata_existing(repository, NodeFileMetadataBlock::index(metadata_node))
         .await
         .forward_any::<MetadataError>("loading the file metadata block")?;
     Ok(block.map_or_else(Hash::default, |block| {

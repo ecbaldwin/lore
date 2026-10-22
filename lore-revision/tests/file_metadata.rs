@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: MIT
 //
 // Cascade fork-local: a node's file metadata read and replaced against an
-// in-memory `State` (`metadata::in_state`), and the undelete path's reset of
-// it (`direct_write`'s `clear_staged_delete`).
+// in-memory `State` (`metadata::in_state`), the undelete path's reset of it
+// (`direct_write`'s `clear_staged_delete`), and its place in every directory
+// hash above it (`commit`'s `ChildHashData`).
 #[cfg(test)]
 mod tests {
     #![allow(clippy::disallowed_methods)] // Test fixture writes; not subject to repository write-token discipline.
@@ -172,10 +173,9 @@ mod tests {
     async fn stored_metadata_reads_back_and_survives_serialization() {
         with_repository(|repository, write_token, tree_state| async move {
             let node = stage(&repository, &tree_state, "d/a.txt", b"content").await;
-            let (none, empty) =
-                in_state::file_metadata_load(repository.clone(), &tree_state, node)
-                    .await
-                    .expect("load");
+            let (none, empty) = in_state::file_metadata_load(repository.clone(), &tree_state, node)
+                .await
+                .expect("load");
             assert!(none.is_zero());
             assert!(empty.is_empty());
 
@@ -294,6 +294,74 @@ mod tests {
         .await;
     }
 
+    async fn hashes(
+        repository: &Arc<RepositoryContext>,
+        tree_state: &state::State,
+        paths: &[&str],
+    ) -> Vec<Hash> {
+        let mut out = Vec::new();
+        for path in paths {
+            let node = tree_state
+                .find_node(repository.clone(), path)
+                .await
+                .expect("find");
+            out.push(node.address.hash);
+        }
+        out
+    }
+
+    #[tokio::test]
+    #[allow(clippy::large_futures)]
+    async fn metadata_moves_every_directory_hash_above_it() {
+        with_repository(|repository, write_token, tree_state| async move {
+            let node = stage(&repository, &tree_state, "d/e/a.txt", b"content").await;
+            stage(&repository, &tree_state, "f/b.txt", b"beside").await;
+            let dirs = ["", "d", "d/e", "f"];
+            let fresh = resync(&repository, &write_token, &tree_state).await;
+            let before = hashes(&repository, &fresh, &dirs).await;
+
+            let stored = in_state::file_metadata_store(
+                repository.clone(),
+                &tree_state,
+                node,
+                Hash::default(),
+                &with_key("xattr.k", b"v"),
+            )
+            .await
+            .expect("store")
+            .expect("stored");
+            let fresh = resync(&repository, &write_token, &tree_state).await;
+            let with = hashes(&repository, &fresh, &dirs).await;
+            for i in 0..3 {
+                assert_ne!(with[i], before[i], "{:?} kept its hash", dirs[i]);
+            }
+            assert_eq!(with[3], before[3], "a directory beside it moved");
+            let file = fresh
+                .find_node(repository.clone(), "d/e/a.txt")
+                .await
+                .expect("find");
+            let content = write_leaf(&repository, b"content").await;
+            assert_eq!(
+                file.address.hash, content.address.hash,
+                "the file's own hash moved"
+            );
+
+            in_state::file_metadata_store(
+                repository.clone(),
+                &tree_state,
+                node,
+                stored,
+                &Metadata::new(),
+            )
+            .await
+            .expect("store")
+            .expect("cleared");
+            let fresh = resync(&repository, &write_token, &tree_state).await;
+            assert_eq!(hashes(&repository, &fresh, &dirs).await, before);
+        })
+        .await;
+    }
+
     #[tokio::test]
     #[allow(clippy::large_futures)]
     async fn recreating_a_deleted_path_starts_with_no_metadata() {
@@ -321,7 +389,10 @@ mod tests {
             let (hash, _) = in_state::file_metadata_load(repository.clone(), &fresh, node)
                 .await
                 .expect("load");
-            assert!(hash.is_zero(), "the recreated file has the old one's metadata");
+            assert!(
+                hash.is_zero(),
+                "the recreated file has the old one's metadata"
+            );
         })
         .await;
     }
@@ -344,7 +415,10 @@ mod tests {
             )
             .await;
             assert!(refused.is_err());
-            let still = tree_state.node(repository.clone(), node).await.expect("node");
+            let still = tree_state
+                .node(repository.clone(), node)
+                .await
+                .expect("node");
             assert!(still.is_staged_delete(), "the store must not undelete it");
         })
         .await;

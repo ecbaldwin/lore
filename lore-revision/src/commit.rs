@@ -3256,6 +3256,43 @@ impl NodeHashData {
     }
 }
 
+/// Cascade fork-local: a child's contribution to its directory's hash. Its
+/// [`NodeHashData`], then its file metadata hash when it carries any, so a
+/// change to a node's metadata (cascade keeps extended attributes there)
+/// changes the hash of every directory above it, as a content change does. A
+/// child without metadata hashes exactly as upstream.
+#[derive(Copy, Clone, Debug)]
+struct ChildHashData {
+    node: NodeHashData,
+    metadata: Hash,
+}
+
+impl ChildHashData {
+    async fn of(
+        repository: &Arc<RepositoryContext>,
+        state: &State,
+        node_id: NodeID,
+        node: &Node,
+    ) -> Result<Self, CommitError> {
+        let metadata =
+            crate::metadata::in_state::file_metadata_hash(repository.clone(), state, node_id)
+                .await
+                .forward_any::<CommitError>("Failed reading file metadata")?;
+        Ok(ChildHashData {
+            node: NodeHashData::from_node(node),
+            metadata,
+        })
+    }
+
+    fn hash_into(&self, hasher: &mut blake3::Hasher) {
+        // Assumes little endian
+        hasher.update(self.node.as_bytes());
+        if !self.metadata.is_zero() {
+            hasher.update(self.metadata.as_bytes());
+        }
+    }
+}
+
 pub async fn rehash_directory(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
@@ -3276,7 +3313,7 @@ pub async fn rehash_directory(
     lore_trace!("Rehash directory node {} address {}", node_id, node.address);
     debug_assert!(node.is_directory());
 
-    let mut child_data: Vec<NodeHashData> = vec![];
+    let mut child_data: Vec<ChildHashData> = vec![];
 
     let mut total_size = 0;
     let mut children = StateNodeChildrenIterator::new(state.clone(), repository.clone(), node_id)
@@ -3382,7 +3419,13 @@ pub async fn rehash_directory(
 
             total_size += child_node.size;
 
-            child_data.push(NodeHashData::from_node(&child_node));
+            match ChildHashData::of(&repository, &state, child_node_id, &child_node).await {
+                Ok(data) => child_data.push(data),
+                Err(err) => {
+                    walk_failure = Some(err);
+                    break;
+                }
+            }
         }
     }
 
@@ -3390,7 +3433,7 @@ pub async fn rehash_directory(
     while let Some(task) = tasks.join_next().await {
         match task {
             Ok(Ok(result)) => {
-                total_size += result.size;
+                total_size += result.node.size;
                 child_data.push(result);
             }
             Ok(Err(err)) => {
@@ -3406,12 +3449,11 @@ pub async fn rehash_directory(
     }
     task_failure.internal("Recursion task failed")?;
 
-    child_data.sort_unstable_by_key(|lhs| lhs.name_hash);
+    child_data.sort_unstable_by_key(|lhs| lhs.node.name_hash);
 
     let mut hasher = blake3::Hasher::new();
     for data in child_data.iter() {
-        // Assumes little endian
-        hasher.update(data.as_bytes());
+        data.hash_into(&mut hasher);
     }
     let blake3_hash = hasher.finalize();
 
@@ -3447,7 +3489,7 @@ fn rehash_directory_recurse(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
     node_id: NodeID,
-) -> Pin<Box<dyn Future<Output = Result<NodeHashData, CommitError>> + Send>> {
+) -> Pin<Box<dyn Future<Output = Result<ChildHashData, CommitError>> + Send>> {
     Box::pin(async move {
         rehash_directory(repository.clone(), state.clone(), node_id).await?;
 
@@ -3459,7 +3501,7 @@ fn rehash_directory_recurse(
             .forward::<CommitError>("Failed deserializing state block")?;
         let node = block.node(node_index);
 
-        Ok(NodeHashData::from_node(&node))
+        ChildHashData::of(&repository, &state, node_id, &node).await
     })
 }
 
@@ -3509,7 +3551,7 @@ pub async fn rehash_staged_directory(
     debug_assert!(node.is_directory());
 
     let mut tasks = JoinSet::new();
-    let mut child_data: Vec<NodeHashData> = vec![];
+    let mut child_data: Vec<ChildHashData> = vec![];
 
     let mut total_size = 0;
     let mut children = StateNodeChildrenIterator::new(state.clone(), repository.clone(), node_id)
@@ -3560,7 +3602,8 @@ pub async fn rehash_staged_directory(
             );
 
             total_size += child_node.size;
-            child_data.push(NodeHashData::from_node(&child_node));
+            child_data
+                .push(ChildHashData::of(&repository, &state, child_node_id, &child_node).await?);
         }
     }
 
@@ -3568,7 +3611,7 @@ pub async fn rehash_staged_directory(
     while let Some(task) = tasks.join_next().await {
         if let Ok(result) = task {
             let result = result?;
-            total_size += result.size;
+            total_size += result.node.size;
             child_data.push(result);
         } else {
             task_failure = Err(task.unwrap_err());
@@ -3576,12 +3619,11 @@ pub async fn rehash_staged_directory(
     }
     task_failure.internal("Recursion task failed")?;
 
-    child_data.sort_unstable_by_key(|lhs| lhs.name_hash);
+    child_data.sort_unstable_by_key(|lhs| lhs.node.name_hash);
 
     let mut hasher = blake3::Hasher::new();
     for data in child_data.iter() {
-        // Assumes little endian
-        hasher.update(data.as_bytes());
+        data.hash_into(&mut hasher);
     }
     let blake3_hash = hasher.finalize();
 
@@ -3617,7 +3659,7 @@ fn rehash_staged_directory_recurse(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
     node_id: NodeID,
-) -> Pin<Box<dyn Future<Output = Result<NodeHashData, CommitError>> + Send>> {
+) -> Pin<Box<dyn Future<Output = Result<ChildHashData, CommitError>> + Send>> {
     Box::pin(async move {
         rehash_staged_directory(repository.clone(), state.clone(), node_id).await?;
 
@@ -3629,7 +3671,7 @@ fn rehash_staged_directory_recurse(
             .forward::<CommitError>("Failed deserializing state block")?;
         let node = block.node(node_index);
 
-        Ok(NodeHashData::from_node(&node))
+        ChildHashData::of(&repository, &state, node_id, &node).await
     })
 }
 
