@@ -3414,6 +3414,32 @@ impl LocalImmutableStore {
         Ok(())
     }
 
+    /// Tombstone one address and leave its payload in its packfile, unreferenced, for compaction:
+    /// see [`ImmutableStore::obliterate_lazy`]. The tombstone goes to disk with the group's next
+    /// flush, as [`Tombstone::Kept`]'s does.
+    async fn tombstone_lazily(
+        self: Arc<Self>,
+        partition: Partition,
+        address: Address,
+        stats: Arc<StoreObliterateStats>,
+    ) -> Result<(), StoreError> {
+        let group_index = address.hash.data()[0] as usize;
+        // Compaction need not be held off: it is only the zeroing that has to find the payload
+        // where the entry said it was, and nothing is zeroed here.
+        match self.tombstone(partition, address, true).await? {
+            Tombstone::Already => {}
+            Tombstone::Kept | Tombstone::Zero(_) => {
+                stats.num_fragments.fetch_add(1, atomic::Ordering::Relaxed);
+                self.flush_later(group_index, FragmentFlags::PayloadObliterated.bits())
+                    .await;
+            }
+            Tombstone::ZeroOnceCompactionStops => {
+                unreachable!("tombstoned as if compaction were held off")
+            }
+        }
+        Ok(())
+    }
+
     /// Tombstone the entry of `address`, unless it is one already, see [`Tombstone`]. An entry
     /// whose payload is to be zeroed is tombstoned only with `compaction_stopped`.
     async fn tombstone(
@@ -5770,6 +5796,23 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
             self.clone()
                 .obliterate_impl(partition, address, stats, false)
                 .await
+        )
+        .into()
+    }
+
+    async fn obliterate_lazy(
+        self: Arc<Self>,
+        partition: Partition,
+        address: Address,
+        stats: Arc<StoreObliterateStats>,
+    ) -> Result<(), StoreError> {
+        let _hold = self.hold(Intent::Write).await?;
+        timed!(
+            self.instruments.operation_latency,
+            &self
+                .instruments
+                .get_labels_for_operation_context("obliterate_lazy"),
+            self.clone().tombstone_lazily(partition, address, stats).await
         )
         .into()
     }

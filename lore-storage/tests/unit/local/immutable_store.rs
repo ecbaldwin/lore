@@ -2375,6 +2375,78 @@ async fn compacting_the_unreferenced_evicts_nothing() {
     );
 }
 
+/// A lazy obliterate tombstones the entry and leaves its payload in the packfile, untouched,
+/// until compaction reclaims it; an entry of the same hash under another context keeps the
+/// payload through both. Unflushed, the tombstone is gone after a reopen and the payload reads
+/// back whole.
+#[tokio::test]
+async fn a_lazy_obliterate_leaves_the_payload_to_compaction() {
+    use lore_storage::immutable_store::ImmutableStore;
+    use lore_storage::store_types::StoreObliterateStats;
+
+    let dir = lore_base::test_util::TempDir::new("is_obliterate_lazy_");
+    let partition = Partition::from([0x22u8; 16]);
+    let (group_index, payloads) = payloads_in_one_group(5);
+    let shared = Context::from([7u8; 16]);
+    let lazy = |store: Arc<LocalImmutableStore>, address| async move {
+        store
+            .obliterate_lazy(partition, address, Arc::new(StoreObliterateStats::default()))
+            .await
+            .unwrap();
+    };
+
+    // Unflushed: nothing about the obliterate survives a reopen.
+    let first = {
+        let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+            .await
+            .unwrap();
+        let first = put_payload(&store, partition, Context::default(), &payloads[0], false).await;
+        store.clone().flush(true).await.unwrap();
+        lazy(store.clone(), first).await;
+        first
+    };
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+        .await
+        .unwrap();
+    assert_payloads_read_back(&store, partition, [(first, payloads[0].clone())]).await;
+
+    let mut kept = vec![(first, payloads[0].clone())];
+    let mut dropped = vec![];
+    for (index, payload) in payloads.iter().enumerate().skip(1) {
+        let address = put_payload(&store, partition, Context::default(), payload, false).await;
+        if index % 2 == 0 {
+            dropped.push(address);
+        } else {
+            kept.push((address, payload.clone()));
+        }
+    }
+    // The same bytes as a dropped entry, under another context.
+    let twin = put_payload(&store, partition, shared, &payloads[2], false).await;
+    kept.push((twin, payloads[2].clone()));
+    store.clone().flush(true).await.unwrap();
+    let before = store.group[group_index].packstore.total_size().await.unwrap();
+    for address in &dropped {
+        lazy(store.clone(), *address).await;
+    }
+    store.clone().flush(true).await.unwrap();
+
+    assert_eq!(
+        store.group[group_index].packstore.total_size().await.unwrap(),
+        before,
+        "nothing is zeroed or truncated before compaction"
+    );
+    for address in &dropped {
+        assert!(store.clone().get(partition, *address).await.is_err());
+    }
+    compact_unreferenced_to_the_end(&store).await;
+    assert_eq!(
+        store.group[group_index].packstore.total_size().await.unwrap(),
+        before - 4096,
+        "compaction reclaims the payload no live entry holds, and keeps the shared one"
+    );
+    assert_payloads_read_back(&store, partition, kept).await;
+}
+
 /// The store lists every entry its index holds, each with what it stores: an obliterated one is
 /// listed with no payload held.
 #[tokio::test]

@@ -1511,6 +1511,44 @@ impl ImmutableStore for CompositeStore {
             .await
     }
 
+    /// Mirrors `obliterate_shallow` above, calling `obliterate_lazy` on each target.
+    async fn obliterate_lazy(
+        self: Arc<Self>,
+        partition: Partition,
+        address: Address,
+        stats: Arc<StoreObliterateStats>,
+    ) -> Result<(), StoreError> {
+        if !self.local_durable {
+            let local = self.local.target.clone();
+            let joined = local.try_join_claim();
+
+            lore_spawn!(async move {
+                let _claim = claim_for_task(&local, joined).await;
+                let stats = Arc::new(StoreObliterateStats::default());
+                match local
+                    .obliterate_lazy(partition, address, stats.clone())
+                    .await
+                {
+                    Ok(_) => {
+                        lore_debug!(
+                            "Successfully lazily obliterated from local store for address: {address}, stats: {stats:?}"
+                        );
+                    }
+                    Err(e) => {
+                        lore_error!(
+                            "Failed to lazily obliterate from local store for address: {address}: {e:?}"
+                        );
+                    }
+                }
+            });
+        }
+
+        self.durable
+            .store()
+            .obliterate_lazy(partition, address, stats)
+            .await
+    }
+
     async fn evict(
         self: Arc<Self>,
         max_capacity: usize,

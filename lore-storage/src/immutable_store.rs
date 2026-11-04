@@ -741,6 +741,23 @@ pub trait ImmutableStore: Any + Send + Sync {
         self.obliterate(partition, address, stats).await
     }
 
+    /// Tombstone the address and leave its payload where it is, for compaction to reclaim:
+    /// never cascading into what it lists, zeroing nothing, and writing nothing until the store
+    /// next flushes. For a caller that compacts what it lets go of (see
+    /// [`Self::compact_unreferenced`]) and cannot afford [`Self::obliterate_shallow`]'s synced
+    /// bucket write per address, which it makes so that the tombstone is on disk before the
+    /// payload is zeroed. Without the zeroing nothing needs that order: a crash before the next
+    /// flush brings the entry back as it was, payload and all, and a read that found the
+    /// payload before the tombstone still reads it. Defaults to [`Self::obliterate_shallow`].
+    async fn obliterate_lazy(
+        self: Arc<Self>,
+        partition: Partition,
+        address: Address,
+        stats: Arc<StoreObliterateStats>,
+    ) -> Result<(), StoreError> {
+        self.obliterate_shallow(partition, address, stats).await
+    }
+
     /// Evict fragments from the store until the given max capacity is reached.
     /// When `sync_data` is true, data is synced to the storage media (fsync).
     /// `sink`, when present, receives eviction lifecycle and per-bucket progress.
