@@ -97,6 +97,7 @@ use crate::local::store_lock::ReleasingOpeningClaim;
 use crate::local::store_lock::StoreGuard;
 use crate::local::store_lock::StoreLock;
 use crate::store_types::PayloadRead;
+use crate::store_types::StoreEntryInfo;
 use crate::store_types::StoreGetData;
 use crate::store_types::StoreMatch;
 use crate::store_types::StoreMatchResult;
@@ -120,6 +121,16 @@ const DOT_COMPACT: &str = "compact";
 /// Compaction rewrites a group's packfiles only once at least this percentage of their bytes is
 /// unreferenced. A rewrite copies every referenced byte to reclaim the rest.
 const COMPACTION_MIN_UNREFERENCED_PERCENTAGE: usize = 10;
+
+/// What a compaction pass is for.
+#[derive(Clone, Copy, Debug)]
+enum CompactionPass {
+    /// Bring a store holding at least this many bytes down toward its target size, evicting
+    /// what may be evicted before rewriting.
+    ToSize(usize),
+    /// Rewrite the packfiles that hold unreferenced payloads, at any size, evicting nothing.
+    Unreferenced,
+}
 
 /// Head bytes requested by the composite bucket open: one pool buffer
 /// class, covering fan-out-threshold-sized buckets (~100 KiB) entirely so
@@ -4243,6 +4254,24 @@ impl LocalImmutableStore {
         sync_data: bool,
         sink: Option<crate::gc_event::GcEventSinkRef>,
     ) -> Result<Option<usize>, StoreError> {
+        self.compact_packfiles_as(CompactionPass::ToSize(max_size), at, sync_data, sink)
+            .await
+    }
+
+    /// [`Self::compact_packfiles`] for either kind of pass. One that only reclaims evicts nothing,
+    /// targets no size, and leaves the resume point on disk alone, which belongs to the
+    /// size-driven pass: see [`ImmutableStore::compact_unreferenced`].
+    async fn compact_packfiles_as(
+        self: Arc<Self>,
+        pass: CompactionPass,
+        at: Option<usize>,
+        sync_data: bool,
+        sink: Option<crate::gc_event::GcEventSinkRef>,
+    ) -> Result<Option<usize>, StoreError> {
+        let (max_size, evict) = match pass {
+            CompactionPass::ToSize(max_size) => (max_size, true),
+            CompactionPass::Unreferenced => (0, false),
+        };
         let target_percentage = self.settings.target_size_percentage;
         let target_size = (max_size * target_percentage) / 100;
 
@@ -4352,10 +4381,11 @@ impl LocalImmutableStore {
             let group_sink = sink.clone();
             lore_base::lore_spawn!(
                 tasks,
-                store.compact_group_packfiles(
+                store.compact_group_packfiles_as(
                     group_index,
                     path,
                     target_size,
+                    evict,
                     protect_local_fragment,
                     sync_data,
                     self.instruments.compaction.clone(),
@@ -4388,7 +4418,7 @@ impl LocalImmutableStore {
 
         group_index += parallel_group_count;
 
-        if let Some(path) = self.path.as_ref() {
+        if evict && let Some(path) = self.path.as_ref() {
             let path = path.join(DOT_COMPACT);
             if group_index < GROUP_COUNT {
                 let _ = lore_io::IoDriver::global()
@@ -4443,12 +4473,40 @@ impl LocalImmutableStore {
     /// group whose buckets are laid out for a fan-out not yet committed on disk, see
     /// [`ImmutableStoreGroup::fan_out_uncommitted`].
     #[lore_macro::test_pub]
+    // The passes themselves go through `compact_group_packfiles_as`; this is the tests' way in.
+    #[cfg_attr(not(feature = "test-util"), allow(dead_code))]
     #[allow(clippy::too_many_arguments)]
     async fn compact_group_packfiles(
         self: Arc<Self>,
         group_index: usize,
         path: Option<Arc<PathBuf>>,
         target_size: usize,
+        protect_local_fragment: bool,
+        sync_data: bool,
+        instruments: CompactionInstruments,
+        sink: Option<crate::gc_event::GcEventSinkRef>,
+    ) -> Result<bool, StoreError> {
+        self.compact_group_packfiles_as(
+            group_index,
+            path,
+            target_size,
+            true,
+            protect_local_fragment,
+            sync_data,
+            instruments,
+            sink,
+        )
+        .await
+    }
+
+    /// [`Self::compact_group_packfiles`], skipping the eviction when `evict` is false.
+    #[allow(clippy::too_many_arguments)]
+    async fn compact_group_packfiles_as(
+        self: Arc<Self>,
+        group_index: usize,
+        path: Option<Arc<PathBuf>>,
+        target_size: usize,
+        evict: bool,
         protect_local_fragment: bool,
         sync_data: bool,
         instruments: CompactionInstruments,
@@ -4467,16 +4525,19 @@ impl LocalImmutableStore {
             return Ok(true);
         }
 
-        let (evicted_count, evicted_size) = self
-            .clone()
-            .evict_group_sized(
-                group_index,
-                target_size,
-                path.clone(),
-                protect_local_fragment,
-                sync_data,
-            )
-            .await;
+        let (evicted_count, evicted_size) = if evict {
+            self.clone()
+                .evict_group_sized(
+                    group_index,
+                    target_size,
+                    path.clone(),
+                    protect_local_fragment,
+                    sync_data,
+                )
+                .await
+        } else {
+            (0, 0)
+        };
         lore_base::lore_debug!(
             "Packstore compactor evicted {evicted_count} fragments, {evicted_size} bytes for group {group_index}"
         );
@@ -5774,6 +5835,52 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
             }
         );
         compacted.into()
+    }
+
+    async fn compact_unreferenced(
+        self: Arc<Self>,
+        at: Option<usize>,
+        sync_data: bool,
+        sink: Option<crate::gc_event::GcEventSinkRef>,
+    ) -> Result<Option<usize>, StoreError> {
+        // Unclaimed, as `compact` is: the pass claims the store itself.
+        let compacted = timed!(
+            self.instruments.operation_latency,
+            &self
+                .instruments
+                .get_labels_for_operation_context("compact_unreferenced"),
+            {
+                self.clone()
+                    .compact_packfiles_as(CompactionPass::Unreferenced, at, sync_data, sink)
+                    .await
+            }
+        );
+        compacted.into()
+    }
+
+    async fn entries(self: Arc<Self>) -> Result<Vec<StoreEntryInfo>, StoreError> {
+        let _hold = self.hold(Intent::Read).await?;
+        self.deserialize_all_buckets()
+            .await
+            .forward::<StoreError>("loading the store's index")?;
+        let mut entries = vec![];
+        for group in self.group.iter() {
+            for bucket_index in 0..group.bucket_count.load(atomic::Ordering::Relaxed) {
+                let Some(bucket) = group.try_bucket(bucket_index) else {
+                    continue;
+                };
+                let bucket = bucket.read().await;
+                entries.extend(bucket.entry.iter().map(|entry| StoreEntryInfo {
+                    partition: entry.partition,
+                    address: entry.address,
+                    flags: entry.data.flags,
+                    size_payload: entry.data.size_payload,
+                    size_content: entry.data.size_content,
+                    stored_locally: entry.data.pack_file != 0,
+                }));
+            }
+        }
+        Ok(entries)
     }
 
     async fn load_index(self: Arc<Self>) -> Result<(), StoreError> {

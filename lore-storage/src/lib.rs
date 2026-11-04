@@ -153,6 +153,7 @@ pub use read::write_all_to_file;
 pub use store_types::KeyType;
 pub use store_types::KeyValueStream;
 pub use store_types::PayloadRead;
+pub use store_types::StoreEntryInfo;
 pub use store_types::StoreGetData;
 pub use store_types::StoreMatch;
 pub use store_types::StoreMatchResult;

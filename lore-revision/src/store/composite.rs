@@ -1540,6 +1540,22 @@ impl ImmutableStore for CompositeStore {
         self.local.store().compact_resume_at().await
     }
 
+    async fn compact_unreferenced(
+        self: Arc<Self>,
+        at: Option<usize>,
+        sync_data: bool,
+        sink: Option<lore_storage::gc_event::GcEventSinkRef>,
+    ) -> Result<Option<usize>, StoreError> {
+        self.local
+            .store()
+            .compact_unreferenced(at, sync_data, sink)
+            .await
+    }
+
+    async fn entries(self: Arc<Self>) -> Result<Vec<lore_storage::StoreEntryInfo>, StoreError> {
+        self.local.store().entries().await
+    }
+
     async fn load_index(self: Arc<Self>) -> Result<(), StoreError> {
         self.local.store().load_index().await
     }

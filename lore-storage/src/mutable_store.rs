@@ -94,6 +94,14 @@ pub trait MutableStore: Send + Sync {
     /// Flush any pending writes to durable storage.
     /// When `sync_data` is true, data is synced to the storage media (fsync).
     async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError>;
+
+    /// Every key-value pair the store holds, of every type and in every partition, as
+    /// `(partition, key, value)`: for an offline sweep of the immutable store, which has to keep
+    /// whatever a value names. Unlike [`Self::list`], it includes untyped keys, which is where
+    /// the anchors are. Stores that hold nothing of their own list nothing.
+    async fn entries(self: Arc<Self>) -> Result<Vec<(Partition, Hash, Hash)>, StoreError> {
+        Ok(Vec::new())
+    }
 }
 
 impl Debug for dyn MutableStore {

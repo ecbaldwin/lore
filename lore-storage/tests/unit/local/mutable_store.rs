@@ -3170,3 +3170,59 @@ async fn list_finds_typed_entries_at_each_fan_out_level() {
         }
     }
 }
+
+/// The store lists every key it holds, read back from disk: untyped keys, which `list` leaves
+/// out, typed ones, and those of every partition.
+#[tokio::test]
+async fn the_store_lists_every_key() {
+    use lore_storage::mutable_store::MutableStore;
+    let dir = lore_base::test_util::TempDir::new("ms_entries_");
+    let open = || async {
+        Arc::new(
+            LocalMutableStore::new(
+                Some(dir.path()),
+                client_settings(),
+                make_in_memory_immutable().await,
+            )
+            .await
+            .expect("store opens"),
+        )
+    };
+    let stored = [
+        (Partition::from([1u8; 16]), KeyType::Untyped, 1u64),
+        (Partition::from([1u8; 16]), KeyType::BranchLatestPointer, 2),
+        (Partition::from([2u8; 16]), KeyType::Instance, 3),
+    ];
+    {
+        let store = open().await;
+        for (partition, key_type, seed) in stored {
+            store
+                .clone()
+                .store(
+                    partition,
+                    Hash::from_u64(seed),
+                    Hash::from_u64(seed + 100),
+                    key_type,
+                )
+                .await
+                .expect("store");
+        }
+        store.clone().flush(true).await.expect("flush");
+    }
+
+    let mut listed: Vec<(Partition, Hash)> = open()
+        .await
+        .entries()
+        .await
+        .expect("entries")
+        .into_iter()
+        .map(|(partition, _key, value)| (partition, value))
+        .collect();
+    listed.sort_unstable();
+    let mut expected: Vec<(Partition, Hash)> = stored
+        .iter()
+        .map(|(partition, _, seed)| (*partition, Hash::from_u64(seed + 100)))
+        .collect();
+    expected.sort_unstable();
+    assert_eq!(listed, expected);
+}

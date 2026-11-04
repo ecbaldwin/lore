@@ -29,6 +29,7 @@ use crate::errors::PayloadNotFound;
 use crate::errors::SlowDown;
 use crate::local::store_lock::StoreGuard;
 use crate::store_types::PayloadRead;
+use crate::store_types::StoreEntryInfo;
 use crate::store_types::StoreGetData;
 use crate::store_types::StoreMatch;
 use crate::store_types::StoreMatchResult;
@@ -764,6 +765,32 @@ pub trait ImmutableStore: Any + Send + Sync {
 
     /// Return the current resume point for compaction
     async fn compact_resume_at(self: Arc<Self>) -> Option<usize>;
+
+    /// Run a step of a pass that rewrites the packfiles holding unreferenced payloads, whatever
+    /// the store's size, and evicts nothing: for a caller that obliterates what it no longer
+    /// needs and wants the space back without trimming what the store caches. A step covers the
+    /// groups `compact` would, from `at`, or starts a pass when `at` is `None`, and returns the
+    /// group the next step starts at, or `None` when the pass is done. The resume point stays
+    /// the caller's: the pass neither reads nor writes the one [`Self::compact_resume_at`]
+    /// returns, which belongs to the size-driven pass. A group under the minimum share of
+    /// unreferenced bytes that `compact` requires is left as it is. Stores that do not compact
+    /// do nothing.
+    async fn compact_unreferenced(
+        self: Arc<Self>,
+        at: Option<usize>,
+        sync_data: bool,
+        sink: Option<crate::gc_event::GcEventSinkRef>,
+    ) -> Result<Option<usize>, StoreError> {
+        let _ = (at, sync_data, sink);
+        Ok(None)
+    }
+
+    /// Every entry the store indexes, with the whole index loaded first: for an offline sweep
+    /// that has to find what nothing references. Stores that keep no index of their own list
+    /// nothing.
+    async fn entries(self: Arc<Self>) -> Result<Vec<StoreEntryInfo>, StoreError> {
+        Ok(Vec::new())
+    }
 
     /// Load every part of the index the store otherwise loads on demand. The default loads
     /// nothing.

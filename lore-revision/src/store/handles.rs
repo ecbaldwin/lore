@@ -50,6 +50,11 @@ impl<'a> ReadHandle<'a> {
     ) -> Result<KeyValueStream, StoreError> {
         self.store.clone().list(partition, key_type).await
     }
+
+    /// See [`MutableStore::entries`].
+    pub async fn entries(&self) -> Result<Vec<(Partition, Hash, Hash)>, StoreError> {
+        self.store.clone().entries().await
+    }
 }
 
 /// Write-capable handle to a [`MutableStore`], scoped to the borrow of a

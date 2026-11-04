@@ -2296,6 +2296,140 @@ async fn compact_with_one_orphan(dir_prefix: &str, local: usize) -> (usize, bool
     )
 }
 
+/// Runs [`ImmutableStore::compact_unreferenced`] passes over `store` to the end.
+async fn compact_unreferenced_to_the_end(store: &Arc<LocalImmutableStore>) {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let mut at = None;
+    while let Some(next) = store
+        .clone()
+        .compact_unreferenced(at, false, None)
+        .await
+        .unwrap()
+    {
+        at = Some(next);
+    }
+}
+
+/// A pass that only reclaims takes back what was obliterated and evicts nothing, durable payloads
+/// included, however small the store: the space dropped entries leave, without trimming what the
+/// store caches. It leaves the size-driven pass's resume point alone.
+#[tokio::test]
+async fn compacting_the_unreferenced_evicts_nothing() {
+    use lore_storage::immutable_store::ImmutableStore;
+    use lore_storage::store_types::StoreObliterateStats;
+
+    let dir = lore_base::test_util::TempDir::new("is_compact_unref_");
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+        .await
+        .unwrap();
+
+    let partition = Partition::from([0x1fu8; 16]);
+    let (group_index, payloads) = payloads_in_one_group(6);
+    let mut kept = vec![];
+    let mut dropped = vec![];
+    for (index, payload) in payloads.iter().enumerate() {
+        let address = put_payload(&store, partition, Context::default(), payload, index < 2).await;
+        if index < 4 {
+            kept.push((address, payload.clone()));
+        } else {
+            dropped.push(address);
+        }
+    }
+    for address in dropped {
+        store
+            .clone()
+            .obliterate(
+                partition,
+                address,
+                Arc::new(StoreObliterateStats::default()),
+            )
+            .await
+            .unwrap();
+    }
+    store.clone().flush(true).await.unwrap();
+
+    compact_unreferenced_to_the_end(&store).await;
+
+    assert_eq!(
+        store.group[group_index]
+            .packstore
+            .total_size()
+            .await
+            .unwrap(),
+        4 * 4096,
+        "the obliterated payloads are reclaimed and nothing else"
+    );
+    assert_eq!(
+        payload_kept_by_durability(&group_entries(&store, group_index).await)
+            .into_iter()
+            .filter(|(_, held)| *held)
+            .count(),
+        4,
+        "both durable payloads are still held, beside both local ones"
+    );
+    assert_payloads_read_back(&store, partition, kept).await;
+    assert!(
+        !dir.path().join("compact").exists(),
+        "the size-driven pass's resume point is not written"
+    );
+}
+
+/// The store lists every entry its index holds, each with what it stores: an obliterated one is
+/// listed with no payload held.
+#[tokio::test]
+async fn the_store_lists_every_entry() {
+    use lore_storage::immutable_store::ImmutableStore;
+    use lore_storage::store_types::StoreObliterateStats;
+
+    let dir = lore_base::test_util::TempDir::new("is_entries_");
+    let (address, durable, dropped) = {
+        let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+            .await
+            .unwrap();
+        let partition = Partition::from([0x21u8; 16]);
+        let (_, payloads) = payloads_in_one_group(3);
+        let address = put_payload(&store, partition, Context::default(), &payloads[0], false).await;
+        let durable = put_payload(&store, partition, Context::default(), &payloads[1], true).await;
+        let dropped = put_payload(&store, partition, Context::default(), &payloads[2], false).await;
+        store
+            .clone()
+            .obliterate(
+                partition,
+                dropped,
+                Arc::new(StoreObliterateStats::default()),
+            )
+            .await
+            .unwrap();
+        store.clone().flush(true).await.unwrap();
+        (address, durable, dropped)
+    };
+
+    // Opened again, so the index has to be loaded to be listed.
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+        .await
+        .unwrap();
+    let mut entries = store.clone().entries().await.unwrap();
+    entries.sort_unstable_by_key(|entry| entry.address);
+    let listed = |wanted: Address| {
+        *entries
+            .iter()
+            .find(|entry| entry.address == wanted)
+            .expect("the entry is listed")
+    };
+    let durable_flag = FragmentFlags::PayloadStoredDurable.bits();
+    assert!(listed(address).stored_locally);
+    assert_eq!(listed(address).flags & durable_flag, 0);
+    assert_eq!(listed(address).size_content, 4096);
+    assert!(listed(durable).stored_locally);
+    assert_ne!(listed(durable).flags & durable_flag, 0);
+    assert!(!listed(dropped).stored_locally);
+    assert_ne!(
+        listed(dropped).flags & FragmentFlags::PayloadObliterated.bits(),
+        0
+    );
+}
+
 /// One orphaned payload in eleven is under the share of unreferenced bytes that makes a rewrite
 /// worth its copying, so compaction leaves the group's packfile in place.
 #[tokio::test]

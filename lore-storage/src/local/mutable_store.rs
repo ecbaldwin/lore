@@ -2017,6 +2017,40 @@ async fn send_group(
 
 #[async_trait]
 impl crate::mutable_store::MutableStore for LocalMutableStore {
+    async fn entries(self: Arc<Self>) -> Result<Vec<(Partition, Hash, Hash)>, StoreError> {
+        let _hold = self.claim(Intent::Read).await?;
+        // `load_group_buckets` sends nothing: it only stops early once its stream closes,
+        // which this one never does while the loads run.
+        let (stream, _open) = tokio::sync::mpsc::unbounded_channel();
+        let mut entries = vec![];
+        for (group_index, group) in self.group.iter().enumerate() {
+            let active_buckets = group.bucket_count.load(atomic::Ordering::Relaxed);
+            load_group_buckets(
+                group,
+                self.path.as_deref().map(PathBuf::as_path),
+                group_index,
+                active_buckets,
+                self.authoritative,
+                &stream,
+            )
+            .await?;
+            // Read under the layout as `send_group` reads: a fan-out loads every bucket it
+            // redistributes.
+            let _layout = group.layout.read().await;
+            let active_buckets = group.bucket_count.load(atomic::Ordering::Relaxed);
+            for bucket_index in 0..active_buckets {
+                let bucket = group.bucket(bucket_index).read().await;
+                entries.extend(
+                    bucket
+                        .entry
+                        .iter()
+                        .map(|entry| (entry.partition, entry.key, entry.value)),
+                );
+            }
+        }
+        Ok(entries)
+    }
+
     async fn hold_for_command(self: Arc<Self>) -> Result<Option<StoreGuard>, StoreError> {
         // Read intent: this hold is for ordering, not for permission. The first write
         // inside the span advances the epoch then.

@@ -26,6 +26,10 @@ impl WriteDiscardingMutableStore {
 
 #[async_trait]
 impl store::MutableStore for WriteDiscardingMutableStore {
+    async fn entries(self: Arc<Self>) -> Result<Vec<(Partition, Hash, Hash)>, StoreError> {
+        self.base.clone().entries().await
+    }
+
     async fn hold_for_command(self: Arc<Self>) -> Result<Option<StoreGuard>, StoreError> {
         self.base.clone().hold_for_command().await
     }

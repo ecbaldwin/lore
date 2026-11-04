@@ -216,6 +216,25 @@ impl StoreMatchResult {
     }
 }
 
+/// One entry of a store's index, as [`ImmutableStore::entries`] lists it.
+///
+/// [`ImmutableStore::entries`]: crate::immutable_store::ImmutableStore::entries
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StoreEntryInfo {
+    /// The partition the entry is filed under.
+    pub partition: Partition,
+    /// The address it associates with its payload.
+    pub address: crate::Address,
+    /// Its stored [`FragmentFlags`](crate::FragmentFlags).
+    pub flags: u32,
+    /// The size of its payload as stored.
+    pub size_payload: u32,
+    /// The size of the content the payload decodes to.
+    pub size_content: u64,
+    /// Whether this store holds the payload, rather than only knowing of it.
+    pub stored_locally: bool,
+}
+
 #[repr(C)]
 #[derive(Debug, Default)]
 pub struct StoreObliterateStats {
