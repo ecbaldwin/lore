@@ -2717,9 +2717,13 @@ fn commit_file(
         // path below. Nothing was read from disk in that case, so there is no
         // modified time to record. Only the address is trusted: the conflict
         // marker check above still reads a file that isn't view-excluded.
+        //
+        // An empty file has the zero address and nothing in the store (Lore stores no
+        // zero-length content), so with the marker it is trusted without the lookup.
         let trust_staged_node = excluded
             || (node.reserved == node::TRUSTED_CONTENT_MARKER
-                && immutable::is_stored_local(repository.clone(), node.address).await);
+                && ((node.size == 0 && node.address.hash.is_zero())
+                    || immutable::is_stored_local(repository.clone(), node.address).await));
         let (address, content_size, mode, modified_time) = if trust_staged_node {
             (node.address, node.size, node.mode, None)
         } else {

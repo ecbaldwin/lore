@@ -69,6 +69,7 @@ use crate::stage::StageError;
 use crate::stage::StageStats;
 use crate::state::State;
 use crate::state::StateError;
+use crate::state::StateNodeChildrenIterator;
 use crate::util::path::RelativePath;
 
 /// A leaf file's content facts, already known to the caller because it
@@ -459,5 +460,67 @@ pub async fn stage_move_from_facts(
         .await
         .forward::<StageError>("moving node")?;
 
+    // A moved file is staged, as is every file under a moved folder, and a
+    // staged file's address counts only with the trust marker (`commit.rs`).
+    // Without it, commit read the file from a working tree this instance
+    // doesn't have (`FileNotFound`). The addresses are the ones the nodes
+    // already had, committed or staged by these functions, so they are
+    // already hashed and stored.
+    if from_node.is_file() {
+        if from_node.reserved != TRUSTED_CONTENT_MARKER {
+            mark_trusted(&state, &repository, from_link.node)
+                .await
+                .forward::<StageError>("marking the moved file trusted")?;
+        }
+    } else {
+        mark_subtree_trusted(&state, &repository, from_link.node)
+            .await
+            .forward::<StageError>("marking the moved folder's files trusted")?;
+    }
+
     Ok(from_link.node)
+}
+
+/// Sets the trust marker on every live file beneath `node_id`.
+async fn mark_subtree_trusted(
+    state: &Arc<State>,
+    repository: &Arc<RepositoryContext>,
+    node_id: NodeID,
+) -> Result<(), StateError> {
+    let mut pending = vec![node_id];
+    while let Some(parent_id) = pending.pop() {
+        let mut children =
+            StateNodeChildrenIterator::new(state.clone(), repository.clone(), parent_id).await?;
+        while let Some((child_id, child)) = children.next().await? {
+            if child.is_staged_delete() || child.is_discarded() {
+                continue;
+            }
+            if child.is_directory() {
+                pending.push(child_id);
+            } else if child.is_file() && child.reserved != TRUSTED_CONTENT_MARKER {
+                mark_trusted(state, repository, child_id).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Sets the trust marker on a file node whose address is already its content's.
+async fn mark_trusted(
+    state: &Arc<State>,
+    repository: &Arc<RepositoryContext>,
+    node_id: NodeID,
+) -> Result<(), StateError> {
+    let block_index = NodeBlock::index(node_id);
+    let block = state.block(repository.clone(), block_index).await?;
+    let dirtied = {
+        let mut block_writer = block.write();
+        block_writer.node(Node::index(node_id)).reserved = TRUSTED_CONTENT_MARKER;
+        block_writer.mark_dirty()
+    };
+    if dirtied {
+        state.block_modified(block, block_index);
+        state.mark_dirty();
+    }
+    Ok(())
 }
