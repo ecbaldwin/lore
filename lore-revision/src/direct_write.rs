@@ -424,8 +424,36 @@ pub async fn stage_move_from_facts(
         return Err(NodeNotFound.into());
     }
 
+    // What can refuse the move is checked before anything is staged: the
+    // destination's delete below isn't undone when a later step fails, so a
+    // refusal after it left the replaced node staged deleted. When the
+    // destination resolves to the source itself (names fold, so a rename that
+    // changes only the case does) there is nothing to replace: staging it
+    // deleted was deleting the source, and then refusing to move a deleted
+    // node.
+    let (to_parent_path, to_name) = split_leaf(to_path);
+    if let Err(error) = node::validate_node_name_for_store(to_name) {
+        return Err(InvalidArguments {
+            reason: format!("destination name is not storable: {error}"),
+        }
+        .into());
+    }
+    let from_folded = from_path.trim_matches('/').to_lowercase();
+    if to_path
+        .trim_matches('/')
+        .to_lowercase()
+        .strip_prefix(from_folded.as_str())
+        .is_some_and(|rest| rest.starts_with('/'))
+    {
+        return Err(InvalidArguments {
+            reason: "destination is inside the node being moved".into(),
+        }
+        .into());
+    }
+
     if let Ok(to_link) = state.find_node_link(repository.clone(), to_path).await
         && to_link.is_valid()
+        && to_link.node != from_link.node
     {
         let to_node = state
             .node(repository.clone(), to_link.node)
@@ -446,7 +474,6 @@ pub async fn stage_move_from_facts(
         }
     }
 
-    let (to_parent_path, to_name) = split_leaf(to_path);
     let to_parent = if to_parent_path.is_empty() {
         ROOT_NODE
     } else {

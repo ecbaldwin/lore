@@ -283,6 +283,103 @@ mod tests {
         .await;
     }
 
+    /// A rename that changes only the case: names fold, so the destination
+    /// resolves to the source itself. It used to be staged deleted as the
+    /// node being replaced, and then the move refused a deleted node.
+    #[tokio::test]
+    #[allow(clippy::large_futures)]
+    async fn a_rename_that_changes_only_the_case_renames_the_node() {
+        with_repository(|repository, write_token, tree_state| async move {
+            let content = write_leaf(&repository, b"kept").await;
+            let original = direct_write::stage_leaf_from_facts(
+                repository.clone(),
+                tree_state.clone(),
+                "dir/Foo.txt",
+                content,
+            )
+            .await
+            .expect("Failed to stage dir/Foo.txt");
+
+            let moved = direct_write::stage_move_from_facts(
+                repository.clone(),
+                tree_state.clone(),
+                "dir/Foo.txt",
+                "dir/foo.txt",
+            )
+            .await
+            .expect("Failed to rename dir/Foo.txt -> dir/foo.txt");
+            assert_eq!(moved, original);
+
+            let fresh = resync(&repository, &write_token, &tree_state).await;
+            let link = fresh
+                .find_node_link(repository.clone(), "dir/FOO.TXT")
+                .await
+                .expect("Failed to find the renamed file");
+            assert_eq!(link.node, original);
+            let node = fresh
+                .node(repository.clone(), link.node)
+                .await
+                .expect("Failed to load the renamed file");
+            assert!(!node.is_staged_delete());
+            assert_eq!(node.address, content.address);
+            let name = fresh
+                .node_name_clone(repository.clone(), link.node)
+                .await
+                .expect("Failed to read the name");
+            assert_eq!(name, "foo.txt");
+        })
+        .await;
+    }
+
+    /// A move the tree can't take is refused before the destination it would
+    /// have replaced is staged deleted, which nothing undoes: a folder moved
+    /// into itself left what was at the destination deleted.
+    #[tokio::test]
+    #[allow(clippy::large_futures)]
+    async fn a_refused_move_replaces_nothing() {
+        with_repository(|repository, write_token, tree_state| async move {
+            let content = write_leaf(&repository, b"inside").await;
+            let inside = direct_write::stage_leaf_from_facts(
+                repository.clone(),
+                tree_state.clone(),
+                "d/sub/x",
+                content,
+            )
+            .await
+            .expect("Failed to stage d/sub/x");
+
+            direct_write::stage_move_from_facts(
+                repository.clone(),
+                tree_state.clone(),
+                "d",
+                "d/sub/x",
+            )
+            .await
+            .expect_err("a folder moved into itself is refused");
+            direct_write::stage_move_from_facts(
+                repository.clone(),
+                tree_state.clone(),
+                "d/sub/x",
+                "d/sub/a\\b",
+            )
+            .await
+            .expect_err("a name the store refuses is refused");
+
+            let fresh = resync(&repository, &write_token, &tree_state).await;
+            let link = fresh
+                .find_node_link(repository.clone(), "d/sub/x")
+                .await
+                .expect("Failed to find d/sub/x");
+            assert_eq!(link.node, inside);
+            let node = fresh
+                .node(repository.clone(), link.node)
+                .await
+                .expect("Failed to load d/sub/x");
+            assert!(!node.is_staged_delete(), "the destination is untouched");
+        })
+        .await;
+    }
+
     /// A rename within one directory onto a destination staged after the
     /// source. The renamed node keeps its place in the child chain, behind the
     /// destination it replaced, which stays there under the same name, staged
