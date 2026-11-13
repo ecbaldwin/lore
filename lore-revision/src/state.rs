@@ -7969,15 +7969,27 @@ async fn collect_file_metadata_blocks(
 async fn collect_name_fragments(
     repository: Arc<RepositoryContext>,
     blocks: Vec<Address>,
+    cache: Option<Arc<FragmentCache>>,
 ) -> Result<Vec<Address>, StateError> {
     let mut tasks = JoinSet::new();
+    let mut name = Vec::with_capacity(blocks.len());
     for address in blocks {
+        if let Some(hash) = cache.as_ref().and_then(|cache| cache.name(address)) {
+            if !hash.is_zero() {
+                name.push(Address::zero_context_hash(hash));
+            }
+            continue;
+        }
+        let cache = cache.clone();
         lore_spawn!(tasks, {
             let repository = repository.clone();
             async move {
                 if let Ok(block_data) =
                     NodeBlockData::read_box_from_immutable(repository.clone(), address, true).await
                 {
+                    if let Some(cache) = cache {
+                        cache.learn_name(address, block_data.name_table);
+                    }
                     Ok(block_data.name_table)
                 } else {
                     // Make sure block can be read even though it has no local name table
@@ -7990,7 +8002,6 @@ async fn collect_name_fragments(
             }
         });
     }
-    let mut name = Vec::with_capacity(tasks.len());
     let mut failure = None;
     while let Some(result) = tasks.join_next().await {
         match result
@@ -8054,6 +8065,177 @@ pub enum Collection {
     Recovery,
 }
 
+/// Cascade fork-local: what [`collect_all_fragments_cached`] learned in one walk, kept for the
+/// next.
+///
+/// A caller that diffs one base against a run of versions that each differ a little from the
+/// last (a server restaging after every write, and diffing each staged version against the
+/// committed one) would otherwise pay for everything the versions add over the base on every
+/// walk: every changed file's fragment list read, and every fragment it names looked up in the
+/// store. What a walk learns about an address is a fact of the content it names, so it holds for
+/// every later walk:
+///
+/// - **an address:** whether the store holds it as a list of fragments, and if so the ones it
+///   names. Only learned from a store that holds the address: one it does not hold is collected
+///   alone, and asked again next time.
+/// - **a node block:** its name table's hash.
+/// - **a file metadata block,** against the one at its index in the base and the node block at
+///   that index in the version: the metadata blobs it adds, and what they name.
+///
+/// Only [`Collection::All`] is cached, since the others depend on which fragments the store holds
+/// durably, which changes. An entry no walk has used in the last two is dropped, so the cache
+/// holds about what one walk's result does.
+#[derive(Default)]
+pub struct FragmentCache {
+    inner: parking_lot::Mutex<FragmentCacheInner>,
+}
+
+type AddressKey = [u8; size_of::<Address>()];
+
+fn address_key(address: &Address) -> AddressKey {
+    let mut key = [0u8; size_of::<Address>()];
+    key.copy_from_slice(address.as_bytes());
+    key
+}
+
+type MetadataBlockKey = [u8; 3 * size_of::<Address>()];
+
+fn metadata_block_key(from: Option<Address>, to: Address, node_block: Address) -> MetadataBlockKey {
+    let mut key = [0u8; 3 * size_of::<Address>()];
+    let size = size_of::<Address>();
+    key[..size].copy_from_slice(from.unwrap_or_default().as_bytes());
+    key[size..2 * size].copy_from_slice(to.as_bytes());
+    key[2 * size..].copy_from_slice(node_block.as_bytes());
+    key
+}
+
+/// `None` for an address collected alone; the addresses a list names otherwise. Beside it, the
+/// last walk that used it.
+type AddressEntry = (Option<Arc<[Address]>>, u64);
+
+#[derive(Default)]
+struct FragmentCacheInner {
+    walk: u64,
+    addresses: std::collections::HashMap<AddressKey, AddressEntry>,
+    names: std::collections::HashMap<AddressKey, (Hash, u64)>,
+    metadata_blocks: std::collections::HashMap<MetadataBlockKey, (Arc<[Address]>, u64)>,
+}
+
+impl FragmentCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// How many entries the cache holds.
+    pub fn len(&self) -> usize {
+        let inner = self.inner.lock();
+        inner.addresses.len() + inner.names.len() + inner.metadata_blocks.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn begin_walk(&self) {
+        self.inner.lock().walk += 1;
+    }
+
+    fn end_walk(&self) {
+        let mut inner = self.inner.lock();
+        let oldest = inner.walk.saturating_sub(1);
+        inner.addresses.retain(|_, (_, used)| *used >= oldest);
+        inner.names.retain(|_, (_, used)| *used >= oldest);
+        inner.metadata_blocks.retain(|_, (_, used)| *used >= oldest);
+    }
+
+    /// Appends what `address` collects, as [`collect_new_addresses`] with [`Collection::All`]
+    /// would, when the cache knows all of it. Appends nothing and answers `false` otherwise.
+    fn collect(&self, address: Address, out: &mut Vec<Address>) -> bool {
+        let mut inner = self.inner.lock();
+        let walk = inner.walk;
+        let start = out.len();
+        let mut pending = vec![address];
+        while let Some(address) = pending.pop() {
+            if address.hash.is_zero() {
+                continue;
+            }
+            let Some((list, used)) = inner.addresses.get_mut(&address_key(&address)) else {
+                out.truncate(start);
+                return false;
+            };
+            *used = walk;
+            if let Some(list) = list {
+                pending.extend(list.iter().copied());
+            }
+            out.push(address);
+        }
+        true
+    }
+
+    fn learn_address(&self, address: Address, list: Option<Arc<[Address]>>) {
+        let mut inner = self.inner.lock();
+        let walk = inner.walk;
+        inner.addresses.insert(address_key(&address), (list, walk));
+    }
+
+    fn name(&self, block: Address) -> Option<Hash> {
+        let mut inner = self.inner.lock();
+        let walk = inner.walk;
+        inner
+            .names
+            .get_mut(&address_key(&block))
+            .map(|(name, used)| {
+                *used = walk;
+                *name
+            })
+    }
+
+    fn learn_name(&self, block: Address, name: Hash) {
+        let mut inner = self.inner.lock();
+        let walk = inner.walk;
+        inner.names.insert(address_key(&block), (name, walk));
+    }
+
+    fn metadata_block(&self, key: &MetadataBlockKey) -> Option<Arc<[Address]>> {
+        let mut inner = self.inner.lock();
+        let walk = inner.walk;
+        inner.metadata_blocks.get_mut(key).map(|(addresses, used)| {
+            *used = walk;
+            addresses.clone()
+        })
+    }
+
+    fn learn_metadata_block(&self, key: MetadataBlockKey, addresses: Arc<[Address]>) {
+        let mut inner = self.inner.lock();
+        let walk = inner.walk;
+        inner.metadata_blocks.insert(key, (addresses, walk));
+    }
+}
+
+/// Cascade fork-local: as [`collect_fragments`] with [`Collection::All`], learning what it can
+/// into `cache` and using what earlier walks learned there — see [`FragmentCache`]. The result is
+/// the one [`collect_fragments`] gives.
+pub async fn collect_all_fragments_cached(
+    repository: Arc<RepositoryContext>,
+    state_from: Arc<State>,
+    state_to: Arc<State>,
+    cache: Arc<FragmentCache>,
+    tracker: Arc<StoreRequestTracker>,
+) -> Result<Vec<Address>, StateError> {
+    cache.begin_walk();
+    let result = collect_fragments_with(
+        repository,
+        state_from,
+        state_to,
+        Collection::All,
+        tracker,
+        Some(cache.clone()),
+    )
+    .await;
+    cache.end_walk();
+    result
+}
+
 /// As [`collect_fragments`], keeping the addresses the local store holds no durable full match
 /// for with `ignore_durably_stored`, and every address without it.
 ///
@@ -8085,15 +8267,28 @@ pub async fn collect_fragments(
     collection: Collection,
     tracker: Arc<StoreRequestTracker>,
 ) -> Result<Vec<Address>, StateError> {
+    collect_fragments_with(repository, state_from, state_to, collection, tracker, None).await
+}
+
+async fn collect_fragments_with(
+    repository: Arc<RepositoryContext>,
+    state_from: Arc<State>,
+    state_to: Arc<State>,
+    collection: Collection,
+    tracker: Arc<StoreRequestTracker>,
+    cache: Option<Arc<FragmentCache>>,
+) -> Result<Vec<Address>, StateError> {
     let from_state_address = lore_spawn!({
         let repository = repository.clone();
         let state = state_from.clone();
         let tracker = tracker.clone();
+        let cache = cache.clone();
         async move {
             let addresses = collect_state_fragments(repository.clone(), state).await?;
             // Collect all from block addresses, even uploaded, as we want to diff against these
             let mut addresses =
-                collect_new_addresses(repository, &addresses, Collection::All, tracker).await?;
+                collect_new_addresses(repository, &addresses, Collection::All, tracker, cache)
+                    .await?;
             addresses.sort_unstable();
             Ok(addresses)
         }
@@ -8103,14 +8298,21 @@ pub async fn collect_fragments(
         let repository = repository.clone();
         let state = state_to.clone();
         let tracker = tracker.clone();
+        let cache = cache.clone();
         async move {
             let addresses = collect_state_fragments(repository.clone(), state).await?;
             let mut addresses =
-                collect_new_addresses(repository, &addresses, collection, tracker).await?;
+                collect_new_addresses(repository, &addresses, collection, tracker, cache).await?;
             addresses.sort_unstable();
             Ok(addresses)
         }
     });
+
+    // The node blocks of `state_to` by index, for the file metadata blocks' cache keys.
+    let to_node_blocks_by_index = match &cache {
+        Some(_) => Some(collect_node_blocks(repository.clone(), state_to.clone()).await?),
+        None => None,
+    };
 
     let from_block_address = lore_spawn!({
         let repository = repository.clone();
@@ -8159,11 +8361,12 @@ pub async fn collect_fragments(
         let state_from = state_from.clone();
         let state_to = state_to.clone();
         let tracker = tracker.clone();
+        let cache = cache.clone();
         async move {
             // Safe to filter these directly to only contain not uploaded fragments, we don't
             // use it as input to any other collection
             collect_new_file_fragments(
-                repository, state_from, state_to, ROOT_NODE, ROOT_NODE, collection, tracker,
+                repository, state_from, state_to, ROOT_NODE, ROOT_NODE, collection, tracker, cache,
             )
             .await
         }
@@ -8173,9 +8376,16 @@ pub async fn collect_fragments(
         let repository = repository.clone();
         let metadata_hash = state_to.metadata_hash();
         let tracker = tracker.clone();
+        let cache = cache.clone();
         async move {
-            collect_new_revision_metadata_fragments(repository, metadata_hash, collection, tracker)
-                .await
+            collect_new_revision_metadata_fragments(
+                repository,
+                metadata_hash,
+                collection,
+                tracker,
+                cache,
+            )
+            .await
         }
     });
 
@@ -8223,10 +8433,12 @@ pub async fn collect_fragments(
         let repository = repository.clone();
         let blocks = diff_block_address.clone();
         let tracker = tracker.clone();
+        let cache = cache.clone();
         async move {
-            let addresses = collect_name_fragments(repository.clone(), blocks).await?;
+            let addresses =
+                collect_name_fragments(repository.clone(), blocks, cache.clone()).await?;
             let mut addresses =
-                collect_new_addresses(repository, &addresses, collection, tracker).await?;
+                collect_new_addresses(repository, &addresses, collection, tracker, cache).await?;
             addresses.sort_unstable();
             Ok(addresses)
         }
@@ -8237,9 +8449,11 @@ pub async fn collect_fragments(
     let new_block_address = lore_spawn!({
         let repository = repository.clone();
         let tracker = tracker.clone();
+        let cache = cache.clone();
         async move {
             let mut addresses =
-                collect_new_addresses(repository, &diff_block_address, collection, tracker).await?;
+                collect_new_addresses(repository, &diff_block_address, collection, tracker, cache)
+                    .await?;
             addresses.sort_unstable();
             Ok(addresses)
         }
@@ -8325,6 +8539,14 @@ pub async fn collect_fragments(
                 // Check which metadata is new
                 let repository = repository.clone();
                 let state_to = state_to.clone();
+                // The node block at the same index decides which nodes are in use. A dirty
+                // state's blocks may not be the ones its block list names.
+                let cache = cache.clone().zip(
+                    to_node_blocks_by_index
+                        .as_ref()
+                        .filter(|_| !state_to.is_dirty())
+                        .and_then(|blocks| blocks.get(block_index).copied()),
+                );
                 lore_spawn!(
                     tasks,
                     collect_new_node_metadata_fragments(
@@ -8335,6 +8557,7 @@ pub async fn collect_fragments(
                         block_index,
                         collection,
                         tracker.clone(),
+                        cache,
                     )
                 );
             }
@@ -8427,6 +8650,7 @@ pub async fn collect_fragments(
             &[Address::zero_context_hash(metadata_hash)],
             collection,
             tracker,
+            cache,
         )
         .await;
         if let Ok(mut metadata_fragments) = metadata_fragments {
@@ -8496,6 +8720,7 @@ pub async fn collect_fragments(
 ///
 /// Both child lists are sorted by name hash, so each child of `node_to` is paired with the child of
 /// `node_from` carrying its name in one pass over the two, the pairing [`diff()`] makes.
+#[allow(clippy::too_many_arguments)]
 async fn collect_new_file_fragments(
     repository: Arc<RepositoryContext>,
     state_from: Arc<State>,
@@ -8504,7 +8729,10 @@ async fn collect_new_file_fragments(
     node_to: NodeID,
     collection: Collection,
     tracker: Arc<StoreRequestTracker>,
+    cache: Option<Arc<FragmentCache>>,
 ) -> Result<Vec<Address>, StateError> {
+    let cache = cache.filter(|_| collection == Collection::All);
+    let mut new_addresses = vec![];
     let (from, to) = join!(
         state_from.collect_children_unsorted(
             repository.clone(),
@@ -8557,17 +8785,25 @@ async fn collect_new_file_fragments(
 
         if !from_node_id.is_valid_node_id() || modified {
             if to_node.is_file() {
+                if cache
+                    .as_ref()
+                    .is_some_and(|cache| cache.collect(to_node.address, &mut new_addresses))
+                {
+                    continue;
+                }
                 let repository = to.repository.clone();
                 let address = [to_node.address];
                 let tracker = tracker.clone();
+                let cache = cache.clone();
                 lore_spawn!(tasks, async move {
-                    collect_new_addresses(repository, &address, collection, tracker).await
+                    collect_new_addresses(repository, &address, collection, tracker, cache).await
                 });
             } else {
                 let repository = to.repository.clone();
                 let state_from = from.state.clone();
                 let state_to = to.state.clone();
                 let tracker = tracker.clone();
+                let cache = cache.clone();
                 lore_spawn!(tasks, async move {
                     collect_new_file_fragments_recurse(
                         repository,
@@ -8577,6 +8813,7 @@ async fn collect_new_file_fragments(
                         to_node_id,
                         collection,
                         tracker,
+                        cache,
                     )
                     .await
                 });
@@ -8584,7 +8821,6 @@ async fn collect_new_file_fragments(
         }
     }
 
-    let mut new_addresses = vec![];
     while let Some(result) = tasks.join_next().await {
         match result
             .internal("Task failure")
@@ -8607,6 +8843,7 @@ async fn collect_new_file_fragments(
     Ok(new_addresses)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_new_file_fragments_recurse(
     repository: Arc<RepositoryContext>,
     state_from: Arc<State>,
@@ -8615,9 +8852,10 @@ fn collect_new_file_fragments_recurse(
     node_to: NodeID,
     collection: Collection,
     tracker: Arc<StoreRequestTracker>,
+    cache: Option<Arc<FragmentCache>>,
 ) -> Pin<Box<dyn Future<Output = Result<Vec<Address>, StateError>> + Send + 'static>> {
     Box::pin(collect_new_file_fragments(
-        repository, state_from, state_to, node_from, node_to, collection, tracker,
+        repository, state_from, state_to, node_from, node_to, collection, tracker, cache,
     ))
 }
 
@@ -8653,6 +8891,7 @@ fn collect_metadata_address_refs(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn collect_new_node_metadata_fragments(
     repository: Arc<RepositoryContext>,
     state_to: Arc<State>,
@@ -8661,7 +8900,21 @@ async fn collect_new_node_metadata_fragments(
     block_index: usize,
     collection: Collection,
     tracker: Arc<StoreRequestTracker>,
+    cache: Option<(Arc<FragmentCache>, Address)>,
 ) -> Result<Vec<Address>, StateError> {
+    // Cached by the two metadata blocks and the node block that says which nodes are in use.
+    let cached = cache
+        .filter(|_| collection == Collection::All)
+        .map(|(cache, node_block_to)| {
+            let key = metadata_block_key(block_address_from, block_address_to, node_block_to);
+            (cache, key)
+        });
+    if let Some((cache, key)) = &cached
+        && let Some(addresses) = cache.metadata_block(key)
+    {
+        return Ok(addresses.to_vec());
+    }
+
     let metadata_block_from = if let Some(address) = block_address_from {
         NodeFileMetadataBlockData::read_box_from_immutable_compat(repository.clone(), address, true)
             .await
@@ -8707,19 +8960,25 @@ async fn collect_new_node_metadata_fragments(
         collect_metadata_address_refs(&metadata, &mut metadata_refs)?;
     }
 
+    let cache = cached.as_ref().map(|(cache, _)| cache.clone());
     let mut addresses = collect_new_addresses(
         repository.clone(),
         &metadata_blobs,
         collection,
         tracker.clone(),
+        cache.clone(),
     )
     .await?;
     let mut more_addresses =
-        collect_new_addresses(repository, &metadata_refs, collection, tracker).await?;
+        collect_new_addresses(repository, &metadata_refs, collection, tracker, cache).await?;
     addresses.append(&mut more_addresses);
 
     addresses.sort_unstable();
     addresses.dedup();
+
+    if let Some((cache, key)) = cached {
+        cache.learn_metadata_block(key, addresses.as_slice().into());
+    }
 
     Ok(addresses)
 }
@@ -8733,6 +8992,7 @@ async fn collect_new_revision_metadata_fragments(
     metadata_hash: Hash,
     collection: Collection,
     tracker: Arc<StoreRequestTracker>,
+    cache: Option<Arc<FragmentCache>>,
 ) -> Result<Vec<Address>, StateError> {
     if metadata_hash.is_zero() {
         return Ok(vec![]);
@@ -8746,7 +9006,7 @@ async fn collect_new_revision_metadata_fragments(
     collect_metadata_address_refs(&metadata, &mut metadata_refs)?;
 
     let mut addresses =
-        collect_new_addresses(repository, &metadata_refs, collection, tracker).await?;
+        collect_new_addresses(repository, &metadata_refs, collection, tracker, cache).await?;
 
     addresses.sort_unstable();
     addresses.dedup();
@@ -8762,7 +9022,9 @@ async fn collect_new_addresses(
     addresses: &[Address],
     collection: Collection,
     tracker: Arc<StoreRequestTracker>,
+    cache: Option<Arc<FragmentCache>>,
 ) -> Result<Vec<Address>, StateError> {
+    let cache = cache.filter(|_| collection == Collection::All);
     let mut new_addresses = Vec::with_capacity(addresses.len());
 
     const MAX_TASKS: usize = 1000;
@@ -8771,10 +9033,17 @@ async fn collect_new_addresses(
         if address.hash.is_zero() {
             continue;
         }
+        if cache
+            .as_ref()
+            .is_some_and(|cache| cache.collect(*address, &mut new_addresses))
+        {
+            continue;
+        }
 
         let address = *address;
         let repository = repository.clone();
         let tracker = tracker.clone();
+        let cache = cache.clone();
         lore_spawn!(task, {
             async move {
                 let query = {
@@ -8800,6 +9069,9 @@ async fn collect_new_addresses(
                         true,
                     ),
                 };
+                // What the cache may learn: that the address is collected alone, or the list
+                // it names. Only from a store that holds it, and only once its list is read.
+                let mut learned = (query.is_some() && !fragmented).then_some(None);
                 let mut addresses = vec![];
                 if fragmented
                     && let Ok((_fragment, buffer)) = {
@@ -8820,19 +9092,26 @@ async fn collect_new_addresses(
                             hash: reference.hash,
                         });
                     }
-                    if let Ok(mut subaddress) = collect_new_addresses_recurse(
+                    if let Ok(mut collected) = collect_new_addresses_recurse(
                         repository.clone(),
                         subaddress.as_slice(),
                         collection,
                         tracker.clone(),
+                        cache.clone(),
                     )
                     .await
                     {
-                        addresses.append(&mut subaddress);
+                        addresses.append(&mut collected);
+                        if query.is_some() {
+                            learned = Some(Some(Arc::<[Address]>::from(subaddress)));
+                        }
                     }
                 }
                 if new {
                     addresses.push(address);
+                }
+                if let (Some(cache), Some(list)) = (&cache, learned) {
+                    cache.learn_address(address, list);
                 }
                 (!addresses.is_empty()).then_some(addresses)
             }
@@ -8878,9 +9157,10 @@ fn collect_new_addresses_recurse(
     addresses: &[Address],
     collection: Collection,
     tracker: Arc<StoreRequestTracker>,
+    cache: Option<Arc<FragmentCache>>,
 ) -> Pin<Box<dyn Future<Output = Result<Vec<Address>, StateError>> + Send + '_>> {
     Box::pin(collect_new_addresses(
-        repository, addresses, collection, tracker,
+        repository, addresses, collection, tracker, cache,
     ))
 }
 
